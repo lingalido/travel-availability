@@ -146,6 +146,10 @@
   .day .c { font-size: 9.5px; line-height: 1; margin-top: 3px; font-weight: 700; }
   .day .star { position: absolute; top: 3px; right: 5px; font-size: 9px; line-height: 1; color: var(--amber-deep); }
   .day .busytag { position: absolute; top: 3px; left: 5px; font-size: 8.5px; line-height: 1; font-weight: 700; color: var(--busy); }
+  .day .rtag { font-size: 7.5px; line-height: 1; margin-top: 3px; font-weight: 700; text-transform: lowercase;
+    max-width: 92%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .day.holi::after { content: ""; position: absolute; bottom: 3px; left: 4px; width: 4px; height: 4px;
+    border-radius: 50%; background: #6366f1; }
   .day:not(.disabled):hover { box-shadow: 0 0 0 2px var(--amber); z-index: 1; }
   .day:not(.disabled):active { transform: scale(.95); }
   .day.disabled { cursor: default; color: #b7c4d2; }
@@ -255,47 +259,40 @@
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
-/* =========================================================================
-   CONFIG — paste your Supabase project values here (see README).
-   Use the publishable key (sb_publishable_...), or the anon key on older
-   projects — both belong in client code and are limited by your database
-   policies. Passport-type data goes in the Booking tab, where it's encrypted.
-   ========================================================================= */
+/* ================================================================
+   Trip Planner — one shared calendar. Everyone marks availability
+   once; agreed windows become named trips that then block those
+   people from clashing future windows.
+   ================================================================ */
 const SUPABASE_URL = "https://usqohrjsvqmmmjdytwjv.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_9nJccohxBaaSMAdJbP1JCQ_VfK7ip6U";
-
-/* ---- setup / client ---- */
 const configured =
   SUPABASE_URL.startsWith("https://") &&
   !SUPABASE_URL.includes("YOUR-PROJECT") &&
   !SUPABASE_ANON_KEY.includes("YOUR-ANON-KEY");
 const sb = configured ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
-/* ---- state ---- */
+const firstOfThisMonth = () => { const n = new Date(); return new Date(n.getFullYear(), n.getMonth(), 1); };
+
 const state = {
-  room: null,
-  tripName: "",
-  group: null,       // group code, if this trip/hub belongs to a group
-  groupName: "",
-  members: [],       // shared roster [{id,name}]
-  groupTrips: [],    // sibling trips [{room,name,lock_from,lock_to}]
-  lockFrom: null,    // this trip's locked range (the agreed dates)
-  lockTo: null,
-  mode: "trip",      // "trip" | "group" | "landing"
-  people: [],
-  selectedId: null,
-  view: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
-  minLen: 1,
-  maxDrop: 0,
+  cal: null, calName: "",
+  members: [],        // {id,name,days,prefers,busy,busyReasons,locked}
+  trips: [],          // {id,name,date_from,date_to,going:[memberId]}
+  selectedId: null,   // member being edited
+  view: firstOfThisMonth(),
+  minLen: 1, maxDrop: 0,
+  markMode: "free", busyReason: null, availMode: "notbusy",
+  tab: "calendar",    // "calendar" | "trips"
+  openTrip: null,     // trip id open in the Trips tab
+  bookings: [],       // encrypted bookings for the open trip
+  drag: null,
   lastEditAt: 0,
-  tab: "schedule",   // "schedule" | "booking"
-  markMode: "free",  // which state a tap/drag paints: "free" | "busy"
-  busyReason: null,  // optional label applied to newly-marked busy days
-  availMode: "notbusy", // count someone available when: "notbusy" | "free"
-  drag: null,        // active drag-to-fill on the calendar
-  bookings: [],      // encrypted booking entries for this room
+  mode: "cal",        // "cal" | "landing"
 };
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
 /* ---- date helpers (verified) ---- */
 const fmt = (d) => {
   const y = d.getFullYear();
@@ -314,194 +311,56 @@ const prettyRange = (from, to) => {
   return `${left} - ${same ? b.getDate() : b.toLocaleDateString("en-US", opt)}`;
 };
 
-/* ---- overlap logic ---- */
-function computeWindows() {
-  const people = state.people, total = people.length;
-  if (!total) return { windows: [], noConflict: 0, hasMarks: false };
-  const free = {}, pref = {}, busy = {};
-  const marks = new Set();
-  for (const p of people) {
-    const lset = new Set(Object.keys(p.locked || {}));
-    for (const d of p.days) if (!lset.has(d)) { free[d] = (free[d] || 0) + 1; marks.add(d); }
-    for (const d of (p.prefers || [])) if (!lset.has(d)) pref[d] = (pref[d] || 0) + 1;
-    for (const d of (p.busy || [])) { busy[d] = (busy[d] || 0) + 1; marks.add(d); }
-    for (const d of lset) { busy[d] = (busy[d] || 0) + 1; marks.add(d); }
-  }
-  const marked = [...marks].sort();
-  if (!marked.length) return { windows: [], noConflict: 0, hasMarks: false };
-
-  // how many count as available on a day, per the chosen rule
-  const avail = (ds) => state.availMode === "free" ? (free[ds] || 0) : (total - (busy[ds] || 0));
-  const start = parse(marked[0]), end = parse(marked[marked.length - 1]);
-  const all = [];
-  for (let d = new Date(start); d <= end; d = addDays(d, 1)) all.push(fmt(d));
-  const noConflict = all.filter((ds) => !(busy[ds] || 0)).length;
-
-  const windows = [];
-  let i = 0;
-  while (i < all.length) {
-    if (total - avail(all[i]) <= state.maxDrop) {
-      let j = i;
-      while (j < all.length && total - avail(all[j]) <= state.maxDrop) j++;
-      const run = all.slice(i, j);
-      if (run.length >= state.minLen) {
-        const busyMap = new Map(), unconfirmed = new Set();
-        let prefSum = 0, freeSum = 0;
-        for (const rd of run) {
-          prefSum += pref[rd] || 0; freeSum += free[rd] || 0;
-          for (const p of people) {
-            const lk = p.locked && p.locked[rd];
-            if (lk) {
-              if (!busyMap.has(p.name)) busyMap.set(p.name, new Set());
-              busyMap.get(p.name).add(lk);
-            } else if ((p.busy || []).includes(rd)) {
-              if (!busyMap.has(p.name)) busyMap.set(p.name, new Set());
-              const r = (p.busyReasons || {})[rd];
-              if (r) busyMap.get(p.name).add(r);
-            } else if (!p.days.includes(rd)) unconfirmed.add(p.name);
-          }
-        }
-        const busy = [...busyMap.entries()]
-          .map(([name, rs]) => ({ name, reasons: [...rs] }))
-          .sort((a, b) => a.name.localeCompare(b.name));
-        windows.push({ from: run[0], to: run[run.length - 1], len: run.length,
-          busy, unconfirmed: [...unconfirmed],
-          prefScore: prefSum / run.length, freeScore: freeSum / run.length,
-          preferred: prefSum / run.length >= 1 });
-      }
-      i = j;
-    } else i++;
-  }
-  // fewest conflicts first, then the dates people prefer, then most confirmed, then longest
-  windows.sort((a, b) =>
-    a.busy.length - b.busy.length ||
-    b.prefScore - a.prefScore ||
-    b.freeScore - a.freeScore ||
-    b.len - a.len);
-  return { windows: windows.slice(0, 12), noConflict, hasMarks: true };
+/* ---- Philippine public non-working holidays ---- */
+// Most are fixed dates or computable; Holy Week comes from Easter, National Heroes
+// Day is the last Monday of August. Chinese New Year (lunar) is a short lookup.
+// Eid'l Fitr / Eid'l Adha are declared by separate proclamation and are NOT included.
+function easterSunday(y) {                       // Anonymous Gregorian algorithm
+  const a = y % 19, b = Math.floor(y / 100), c = y % 100;
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const mth = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * mth + 114) / 31);
+  const day = ((h + l - 7 * mth + 114) % 31) + 1;
+  return new Date(y, month - 1, day);
 }
-
-/* ---- database ---- */
-async function dbFetch() {
-  const { data, error } = await sb.from("people").select("id,name,days,prefers,busy,busy_reasons,member_id").eq("room", state.room);
-  if (error) { console.error(error); return null; }
-  return data.map((r) => ({ id: r.id, name: r.name, member_id: r.member_id || null,
-                            days: Array.isArray(r.days) ? r.days : [],
-                            prefers: Array.isArray(r.prefers) ? r.prefers : [],
-                            busy: Array.isArray(r.busy) ? r.busy : [],
-                            busyReasons: (r.busy_reasons && typeof r.busy_reasons === "object") ? r.busy_reasons : {},
-                            locked: {} }))
-             .sort((a, b) => a.name.localeCompare(b.name));
+const CNY = { 2025: "01-29", 2026: "02-17", 2027: "02-06", 2028: "01-26", 2029: "02-13", 2030: "02-03" };
+const _holiCache = {};
+function phHolidays(year) {
+  if (_holiCache[year]) return _holiCache[year];
+  const h = {};
+  const set = (mmdd, name) => { h[`${year}-${mmdd}`] = name; };
+  // fixed regular holidays
+  set("01-01", "New Year's Day");
+  set("04-09", "Araw ng Kagitingan");
+  set("05-01", "Labor Day");
+  set("06-12", "Independence Day");
+  set("11-30", "Bonifacio Day");
+  set("12-25", "Christmas Day");
+  set("12-30", "Rizal Day");
+  // fixed special non-working days
+  set("08-21", "Ninoy Aquino Day");
+  set("11-01", "All Saints' Day");
+  set("11-02", "All Souls' Day");
+  set("12-08", "Immaculate Conception");
+  set("12-24", "Christmas Eve");
+  set("12-31", "Last Day of the Year");
+  // Holy Week (from Easter)
+  const easter = easterSunday(year);
+  h[fmt(addDays(easter, -3))] = "Maundy Thursday";
+  h[fmt(addDays(easter, -2))] = "Good Friday";
+  h[fmt(addDays(easter, -1))] = "Black Saturday";
+  // National Heroes Day = last Monday of August
+  let aug = new Date(year, 7, 31);
+  while (aug.getDay() !== 1) aug = addDays(aug, -1);
+  h[fmt(aug)] = "National Heroes Day";
+  // Chinese New Year (lunar lookup)
+  if (CNY[year]) h[`${year}-${CNY[year]}`] = "Chinese New Year";
+  _holiCache[year] = h;
+  return h;
 }
-async function dbAdd(name, memberId) {
-  const row = { room: state.room, name, days: [], prefers: [], busy: [], busy_reasons: {} };
-  if (memberId) row.member_id = memberId;
-  const { data, error } = await sb.from("people").insert(row)
-    .select("id,name,days,prefers,busy,busy_reasons,member_id").single();
-  if (error) { console.error(error); return null; }
-  return { id: data.id, name: data.name, member_id: data.member_id || null,
-           days: [], prefers: [], busy: [], busyReasons: {}, locked: {} };
-}
-async function dbUpdate(id, days, prefers, busy, busyReasons) {
-  const { error } = await sb.from("people")
-    .update({ days, prefers, busy, busy_reasons: busyReasons || {}, updated_at: new Date().toISOString() })
-    .eq("id", id);
-  if (error) console.error(error);
-}
-const savePerson = (p) => dbUpdate(p.id, p.days, p.prefers, p.busy, p.busyReasons);
-async function dbDelete(id) {
-  const { error } = await sb.from("people").delete().eq("id", id);
-  if (error) console.error(error);
-}
-
-/* ---- trip meta (name, group link, locked dates) ---- */
-async function tripMetaFetch(room) {
-  const { data, error } = await sb.from("trips").select("name,group_code,lock_from,lock_to").eq("room", room).limit(1);
-  if (error) { console.error(error); return { name: "", group_code: null, lock_from: null, lock_to: null }; }
-  const r = (data && data.length) ? data[0] : {};
-  return { name: r.name || "", group_code: r.group_code || null, lock_from: r.lock_from || null, lock_to: r.lock_to || null };
-}
-async function tripSetName(name) {
-  const { data: ex } = await sb.from("trips").select("room").eq("room", state.room).limit(1);
-  if (ex && ex.length) {
-    const { error } = await sb.from("trips").update({ name, updated_at: new Date().toISOString() }).eq("room", state.room);
-    if (error) console.error(error);
-  } else {
-    const { error } = await sb.from("trips").insert({ room: state.room, name });
-    if (error) console.error(error);
-  }
-}
-async function tripSetLock(room, from, to) {
-  const { error } = await sb.from("trips").update({ lock_from: from, lock_to: to, updated_at: new Date().toISOString() }).eq("room", room);
-  if (error) console.error(error);
-}
-
-/* ---- groups + shared roster ---- */
-async function groupFetch(code) {
-  const { data, error } = await sb.from("groups").select("code,name").eq("code", code).limit(1);
-  if (error) { console.error(error); return null; }
-  return (data && data.length) ? { code: data[0].code, name: data[0].name || "" } : null;
-}
-async function groupCreate(code, name) {
-  const { error } = await sb.from("groups").insert({ code, name: name || "" });
-  if (error) console.error(error);
-}
-async function groupSetName(name) {
-  const { error } = await sb.from("groups").update({ name }).eq("code", state.group);
-  if (error) console.error(error);
-}
-async function membersFetch(group) {
-  const { data, error } = await sb.from("members").select("id,name").eq("group_code", group);
-  if (error) { console.error(error); return []; }
-  return data.map((r) => ({ id: r.id, name: r.name })).sort((a, b) => a.name.localeCompare(b.name));
-}
-async function memberAdd(group, name) {
-  const { data, error } = await sb.from("members").insert({ group_code: group, name }).select("id,name").single();
-  if (error) { console.error(error); return null; }
-  return { id: data.id, name: data.name };
-}
-async function memberDelete(id) {
-  await sb.from("people").delete().eq("member_id", id);   // drop their availability from every trip
-  const { error } = await sb.from("members").delete().eq("id", id);
-  if (error) console.error(error);
-}
-async function tripsByGroup(group) {
-  const { data, error } = await sb.from("trips").select("room,name,lock_from,lock_to").eq("group_code", group);
-  if (error) { console.error(error); return []; }
-  return data.map((r) => ({ room: r.room, name: r.name || "", lock_from: r.lock_from || null, lock_to: r.lock_to || null }));
-}
-async function tripCreateInGroup(room, group, name) {
-  const { error } = await sb.from("trips").insert({ room, group_code: group, name: name || "" });
-  if (error) console.error(error);
-}
-
-/* ---- cross-trip lock overlay: locked dates from the group's OTHER trips ---- */
-async function overlayFetch() {
-  const locked = {};                       // member_id -> { "YYYY-MM-DD": tripName }
-  if (!state.group) return locked;
-  const siblings = state.groupTrips.filter((t) => t.room !== state.room && t.lock_from && t.lock_to);
-  if (!siblings.length) return locked;
-  const rooms = siblings.map((t) => t.room);
-  const { data, error } = await sb.from("people").select("room,member_id").in("room", rooms);
-  if (error) { console.error(error); return locked; }
-  const goingByRoom = {};
-  for (const r of data) { if (!r.member_id) continue; (goingByRoom[r.room] ||= []).push(r.member_id); }
-  for (const t of siblings) {
-    const label = t.name || "another trip";
-    let d = parse(t.lock_from); const end = parse(t.lock_to);
-    while (d <= end) {
-      const ds = fmt(d);
-      for (const mid of (goingByRoom[t.room] || [])) { (locked[mid] ||= {})[ds] = label; }
-      d = addDays(d, 1);
-    }
-  }
-  return locked;
-}
-function applyOverlay(lockedByMember) {
-  for (const p of state.people) {
-    p.locked = (p.member_id && lockedByMember[p.member_id]) ? lockedByMember[p.member_id] : {};
-  }
-}
+const holidayName = (ds) => phHolidays(Number(ds.slice(0, 4)))[ds] || "";
 
 /* ---- encryption (runs in the browser; the server only ever sees ciphertext) ---- */
 const b64 = (bytes) => { const a = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes); let s = ""; for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return btoa(s); };
@@ -525,122 +384,248 @@ async function decryptJSON(blob, passphrase) {
 }
 const cryptoReady = () => !!(window.crypto && crypto.subtle);
 
-/* ---- booking database (stores encrypted blobs + a plaintext name label) ---- */
-async function bkFetch() {
-  const { data, error } = await sb.from("bookings").select("id,name,blob").eq("room", state.room);
-  if (error) { console.error(error); return null; }
-  return data.map((r) => ({ id: r.id, name: r.name, blob: r.blob })).sort((a, b) => a.name.localeCompare(b.name));
-}
-async function bkUpsert(name, blob) {
-  const { data: ex } = await sb.from("bookings").select("id").eq("room", state.room).eq("name", name).limit(1);
-  if (ex && ex.length) {
-    const { error } = await sb.from("bookings").update({ blob, updated_at: new Date().toISOString() }).eq("id", ex[0].id);
-    if (error) { console.error(error); return false; }
-  } else {
-    const { error } = await sb.from("bookings").insert({ room: state.room, name, blob });
-    if (error) { console.error(error); return false; }
-  }
-  return true;
-}
-async function bkDelete(id) { const { error } = await sb.from("bookings").delete().eq("id", id); if (error) console.error(error); }
-async function bkDeleteAll() { const { error } = await sb.from("bookings").delete().eq("room", state.room); if (error) console.error(error); }
+const currentMember = () => state.members.find((m) => m.id === state.selectedId) || null;
 
-/* ---- actions ---- */
-async function addPerson() {
-  const input = document.getElementById("nameInput");
-  const name = input.value.trim();
-  if (!name) return;
-  input.value = "";
-  let row;
-  if (state.group) {
-    const m = await memberAdd(state.group, name);       // add to the shared roster
-    if (!m) return;
-    state.members = [...state.members, m].sort((a, b) => a.name.localeCompare(b.name));
-    row = await dbAdd(name, m.id);                        // and onto this trip
+/* ================= database ================= */
+async function calFetch(code) {
+  const { data, error } = await sb.from("crews").select("code,name").eq("code", code).limit(1);
+  if (error) { console.error(error); return null; }
+  return (data && data.length) ? { code: data[0].code, name: data[0].name || "" } : null;
+}
+async function calCreate(code, name) {
+  const { error } = await sb.from("crews").insert({ code, name: name || "" });
+  if (error) console.error(error);
+}
+async function calSetName(name) {
+  const { error } = await sb.from("crews").update({ name }).eq("code", state.cal);
+  if (error) console.error(error);
+}
+function mapMember(r) {
+  return { id: r.id, name: r.name,
+           days: Array.isArray(r.days) ? r.days : [],
+           prefers: Array.isArray(r.prefers) ? r.prefers : [],
+           busy: Array.isArray(r.busy) ? r.busy : [],
+           busyReasons: (r.busy_reasons && typeof r.busy_reasons === "object") ? r.busy_reasons : {},
+           locked: {} };
+}
+async function peopleFetch() {
+  const { data, error } = await sb.from("crew_people").select("id,name,days,prefers,busy,busy_reasons").eq("cal", state.cal);
+  if (error) { console.error(error); return null; }
+  return data.map(mapMember).sort((a, b) => a.name.localeCompare(b.name));
+}
+async function peopleAdd(name) {
+  const { data, error } = await sb.from("crew_people")
+    .insert({ cal: state.cal, name, days: [], prefers: [], busy: [], busy_reasons: {} })
+    .select("id,name,days,prefers,busy,busy_reasons").single();
+  if (error) { console.error(error); return null; }
+  return mapMember(data);
+}
+async function peopleUpdate(m) {
+  const { error } = await sb.from("crew_people")
+    .update({ days: m.days, prefers: m.prefers, busy: m.busy, busy_reasons: m.busyReasons, updated_at: new Date().toISOString() })
+    .eq("id", m.id);
+  if (error) console.error(error);
+}
+async function peopleDelete(id) {
+  await sb.from("crew_bookings").delete().eq("member_id", id);
+  const { error } = await sb.from("crew_people").delete().eq("id", id);
+  if (error) console.error(error);
+}
+async function tripsFetch() {
+  const { data, error } = await sb.from("crew_trips").select("id,name,date_from,date_to,going").eq("cal", state.cal);
+  if (error) { console.error(error); return null; }
+  return data.map((r) => ({ id: r.id, name: r.name || "", date_from: r.date_from, date_to: r.date_to,
+                            going: Array.isArray(r.going) ? r.going : [] }))
+             .sort((a, b) => a.date_from.localeCompare(b.date_from));
+}
+async function tripAdd(name, from, to, going) {
+  const { data, error } = await sb.from("crew_trips")
+    .insert({ cal: state.cal, name: name || "", date_from: from, date_to: to, going })
+    .select("id,name,date_from,date_to,going").single();
+  if (error) { console.error(error); return null; }
+  return { id: data.id, name: data.name || "", date_from: data.date_from, date_to: data.date_to, going: data.going || [] };
+}
+async function tripUpdate(id, patch) {
+  const { error } = await sb.from("crew_trips").update(patch).eq("id", id);
+  if (error) console.error(error);
+}
+async function tripDelete(id) {
+  await sb.from("crew_bookings").delete().eq("trip_id", id);
+  const { error } = await sb.from("crew_trips").delete().eq("id", id);
+  if (error) console.error(error);
+}
+async function bkFetch(tripId) {
+  const { data, error } = await sb.from("crew_bookings").select("id,name,member_id,blob").eq("trip_id", tripId);
+  if (error) { console.error(error); return null; }
+  return data.map((r) => ({ id: r.id, name: r.name, member_id: r.member_id, blob: r.blob }))
+             .sort((a, b) => a.name.localeCompare(b.name));
+}
+async function bkUpsert(tripId, memberId, name, blob) {
+  const { data: ex } = await sb.from("crew_bookings").select("id").eq("trip_id", tripId).eq("member_id", memberId).limit(1);
+  if (ex && ex.length) {
+    const { error } = await sb.from("crew_bookings").update({ name, blob, updated_at: new Date().toISOString() }).eq("id", ex[0].id);
+    if (error) console.error(error);
   } else {
-    row = await dbAdd(name);
+    const { error } = await sb.from("crew_bookings").insert({ trip_id: tripId, member_id: memberId, name, blob });
+    if (error) console.error(error);
   }
-  if (!row) return;
-  state.people = [...state.people, row].sort((a, b) => a.name.localeCompare(b.name));
-  state.selectedId = row.id;
-  updateAll();
 }
-async function addMemberToTrip(memberId) {
-  if (state.people.some((p) => p.member_id === memberId)) return;
-  const m = state.members.find((x) => x.id === memberId);
-  if (!m) return;
-  const row = await dbAdd(m.name, m.id);
-  if (!row) return;
-  state.people = [...state.people, row].sort((a, b) => a.name.localeCompare(b.name));
-  state.selectedId = row.id;
-  updateAll();
+async function bkDelete(id) { const { error } = await sb.from("crew_bookings").delete().eq("id", id); if (error) console.error(error); }
+async function bkDeleteAll(tripId) { const { error } = await sb.from("crew_bookings").delete().eq("trip_id", tripId); if (error) console.error(error); }
+
+/* trips block their going-members on the shared calendar (read-only) */
+function applyTripOverlay() {
+  const byId = Object.fromEntries(state.members.map((m) => [m.id, m]));
+  for (const m of state.members) m.locked = {};
+  for (const t of state.trips) {
+    let d = parse(t.date_from); const end = parse(t.date_to);
+    while (d <= end) {
+      const ds = fmt(d);
+      for (const mid of (t.going || [])) { const m = byId[mid]; if (m) m.locked[ds] = t.name || "a trip"; }
+      d = addDays(d, 1);
+    }
+  }
 }
-async function removePerson(id) {
-  state.people = state.people.filter((p) => p.id !== id);
-  if (state.selectedId === id) state.selectedId = state.people[0]?.id ?? null;
-  updateAll();
-  await dbDelete(id);
+
+/* ================= finder ================= */
+function computeWindows() {
+  const people = state.members, total = people.length;
+  if (!total) return { windows: [], noConflict: 0, hasMarks: false };
+  const free = {}, pref = {}, busy = {};
+  const marks = new Set();
+  for (const p of people) {
+    const lset = new Set(Object.keys(p.locked || {}));
+    for (const d of p.days) if (!lset.has(d)) { free[d] = (free[d] || 0) + 1; marks.add(d); }
+    for (const d of (p.prefers || [])) if (!lset.has(d)) pref[d] = (pref[d] || 0) + 1;
+    for (const d of (p.busy || [])) { busy[d] = (busy[d] || 0) + 1; marks.add(d); }
+    for (const d of lset) { busy[d] = (busy[d] || 0) + 1; marks.add(d); }
+  }
+  const marked = [...marks].sort();
+  if (!marked.length) return { windows: [], noConflict: 0, hasMarks: false };
+  const avail = (ds) => state.availMode === "free" ? (free[ds] || 0) : (total - (busy[ds] || 0));
+  const start = parse(marked[0]), end = parse(marked[marked.length - 1]);
+  const all = [];
+  for (let d = new Date(start); d <= end; d = addDays(d, 1)) all.push(fmt(d));
+  const noConflict = all.filter((ds) => !(busy[ds] || 0)).length;
+  const windows = [];
+  let i = 0;
+  while (i < all.length) {
+    if (total - avail(all[i]) <= state.maxDrop) {
+      let j = i;
+      while (j < all.length && total - avail(all[j]) <= state.maxDrop) j++;
+      const run = all.slice(i, j);
+      if (run.length >= state.minLen) {
+        const busyMap = new Map(), unconfirmed = new Set();
+        let prefSum = 0, freeSum = 0;
+        for (const rd of run) {
+          prefSum += pref[rd] || 0; freeSum += free[rd] || 0;
+          for (const p of people) {
+            const lk = p.locked && p.locked[rd];
+            if (lk) { if (!busyMap.has(p.name)) busyMap.set(p.name, new Set()); busyMap.get(p.name).add(lk); }
+            else if ((p.busy || []).includes(rd)) {
+              if (!busyMap.has(p.name)) busyMap.set(p.name, new Set());
+              const r = (p.busyReasons || {})[rd]; if (r) busyMap.get(p.name).add(r);
+            } else if (!p.days.includes(rd)) unconfirmed.add(p.name);
+          }
+        }
+        const bz = [...busyMap.entries()].map(([name, rs]) => ({ name, reasons: [...rs] })).sort((a, b) => a.name.localeCompare(b.name));
+        windows.push({ from: run[0], to: run[run.length - 1], len: run.length, busy: bz, unconfirmed: [...unconfirmed],
+          prefScore: prefSum / run.length, freeScore: freeSum / run.length, preferred: prefSum / run.length >= 1 });
+      }
+      i = j;
+    } else i++;
+  }
+  windows.sort((a, b) => a.busy.length - b.busy.length || b.prefScore - a.prefScore || b.freeScore - a.freeScore || b.len - a.len);
+  return { windows: windows.slice(0, 12), noConflict, hasMarks: true };
 }
+
+/* ================= day rendering helpers ================= */
+function dayInfo(ds) {
+  let free = 0, busy = 0; const bnames = [];
+  for (const p of state.members) {
+    const lk = p.locked && p.locked[ds];
+    if (lk) { busy++; bnames.push(`${p.name} (${lk})`); continue; }
+    if ((p.busy || []).includes(ds)) { busy++; const r = (p.busyReasons || {})[ds]; bnames.push(r ? `${p.name} (${r})` : p.name); }
+    else if (p.days.includes(ds)) free++;
+  }
+  let title = "";
+  if (free) title += `${free} free`;
+  if (busy) title += (title ? " · " : "") + "busy: " + bnames.join(", ");
+  const holi = holidayName(ds);
+  if (holi) title += (title ? " · " : "") + "PH: " + holi;
+  return { free, busy, title };
+}
+function dayClass(free, busy, total) {
+  if (busy > 0) { const r = busy / total; return r >= 1 ? "b-all" : r >= 0.5 ? "b-some" : "b-few"; }
+  if (free > 0) { const r = free / total; return r === 1 ? "h-all" : r >= 0.75 ? "h-most" : r >= 0.5 ? "h-half" : "h-few"; }
+  return "h-none";
+}
+function cellInner(dnum, free, busy, myPref, locked, myReason) {
+  const bottom = myReason ? `<span class="rtag">${escapeHtml(myReason)}</span>` : (free ? `<span class="c">${free}</span>` : "");
+  return `${myPref ? `<span class="star">&#9733;</span>` : ""}` +
+         `${busy ? `<span class="busytag">${busy}</span>` : ""}` +
+         `<span class="n">${dnum}</span>` + bottom +
+         `${locked ? `<span class="lock" title="On a trip: ${escapeHtml(locked)}">&#128274;</span>` : ""}`;
+}
+function updateDayCell(ds) {
+  const grid = document.getElementById("calGrid"); if (!grid) return;
+  const cell = grid.querySelector(`[data-day="${ds}"]`); if (!cell) return;
+  const total = state.members.length;
+  const { free, busy, title } = dayInfo(ds);
+  const p = currentMember();
+  const iLocked = p && p.locked && p.locked[ds];
+  const iFree = p && p.days.includes(ds) && !iLocked;
+  const iBusy = p && (p.busy || []).includes(ds);
+  const myPref = p && (p.prefers || []).includes(ds);
+  const myReason = (iBusy && !iLocked) ? (p.busyReasons || {})[ds] : "";
+  const holi = holidayName(ds);
+  cell.className = `day ${dayClass(free, busy, total)} ${iFree ? "mine" : ""} ${(iBusy || iLocked) ? "mine-busy" : ""} ${iLocked ? "locked" : ""} ${holi ? "holi" : ""} ${ds === fmt(new Date()) ? "today" : ""} ${p ? "" : "disabled"}`;
+  cell.title = title;
+  cell.innerHTML = cellInner(parse(ds).getDate(), free, busy, myPref, iLocked || "", myReason || "");
+}
+
+/* ================= marking ================= */
 async function toggleDay(ds) {
-  const p = currentPerson(); if (!p) return;
-  if (p.locked && p.locked[ds]) return;   // committed to another trip — read-only here
+  const p = currentMember(); if (!p) return;
+  if (p.locked && p.locked[ds]) return;   // on a trip — read-only
   const prefers = p.prefers || [], busy = p.busy || [], reasons = p.busyReasons || {};
   let days = p.days, prefs = prefers, bus = busy, rs = { ...reasons };
   if (state.markMode === "busy") {
-    if (busy.includes(ds)) {                 // busy -> clear
-      bus = busy.filter((d) => d !== ds); delete rs[ds];
-    } else {                                  // anything -> busy (clears free/pref)
+    if (busy.includes(ds)) {
+      if (state.busyReason && rs[ds] !== state.busyReason) rs[ds] = state.busyReason;
+      else { bus = busy.filter((d) => d !== ds); delete rs[ds]; }
+    } else {
       bus = [...busy, ds];
       if (state.busyReason) rs[ds] = state.busyReason;
-      days = p.days.filter((d) => d !== ds);
-      prefs = prefers.filter((d) => d !== ds);
+      days = p.days.filter((d) => d !== ds); prefs = prefers.filter((d) => d !== ds);
     }
   } else {
-    if (busy.includes(ds)) {                  // busy -> free
-      bus = busy.filter((d) => d !== ds); delete rs[ds];
-      days = [...p.days, ds];
-    } else if (!p.days.includes(ds)) {         // clear -> free
-      days = [...p.days, ds];
-    } else if (!prefers.includes(ds)) {        // free -> preferred
-      prefs = [...prefers, ds];
-    } else {                                    // preferred -> clear
-      days = p.days.filter((d) => d !== ds);
-      prefs = prefers.filter((d) => d !== ds);
-    }
+    if (busy.includes(ds)) { bus = busy.filter((d) => d !== ds); delete rs[ds]; days = [...p.days, ds]; }
+    else if (!p.days.includes(ds)) days = [...p.days, ds];
+    else if (!prefers.includes(ds)) prefs = [...prefers, ds];
+    else { days = p.days.filter((d) => d !== ds); prefs = prefers.filter((d) => d !== ds); }
   }
   p.days = days; p.prefers = prefs; p.busy = bus; p.busyReasons = rs;
   state.lastEditAt = Date.now();
   updateRoster(); updateCalendar(); updateResults();
-  await savePerson(p);
+  await peopleUpdate(p);
 }
-
-const currentPerson = () => state.people.find((p) => p.id === state.selectedId) || null;
-
-/* ---- drag to fill a range (pointer = mouse + touch) ---- */
 function paintDay(ds, action) {
-  const p = currentPerson(); if (!p) return;
-  if (p.locked && p.locked[ds]) return;   // locked by another trip
+  const p = currentMember(); if (!p) return;
+  if (p.locked && p.locked[ds]) return;
   if (!p.busyReasons) p.busyReasons = {};
   const rm = (arr) => (arr || []).filter((d) => d !== ds);
-  if (action === "setFree") {
-    p.busy = rm(p.busy); delete p.busyReasons[ds];
-    if (!p.days.includes(ds)) p.days = [...p.days, ds];
-  } else if (action === "clearFree") {
-    p.days = rm(p.days); p.prefers = rm(p.prefers);
-  } else if (action === "setBusy") {
-    p.days = rm(p.days); p.prefers = rm(p.prefers);
-    if (!(p.busy || []).includes(ds)) p.busy = [...(p.busy || []), ds];
-    if (state.busyReason) p.busyReasons[ds] = state.busyReason;
-  } else if (action === "clearBusy") {
-    p.busy = rm(p.busy); delete p.busyReasons[ds];
-  }
+  if (action === "setFree") { p.busy = rm(p.busy); delete p.busyReasons[ds]; if (!p.days.includes(ds)) p.days = [...p.days, ds]; }
+  else if (action === "clearFree") { p.days = rm(p.days); p.prefers = rm(p.prefers); }
+  else if (action === "setBusy") { p.days = rm(p.days); p.prefers = rm(p.prefers); if (!(p.busy || []).includes(ds)) p.busy = [...(p.busy || []), ds]; if (state.busyReason) p.busyReasons[ds] = state.busyReason; }
+  else if (action === "clearBusy") { p.busy = rm(p.busy); delete p.busyReasons[ds]; }
   updateDayCell(ds);
 }
 function onCalPointerDown(e) {
-  const cell = e.target.closest("[data-day]");
-  if (!cell || !state.selectedId) return;
-  const p = currentPerson(); if (!p) return;
+  const cell = e.target.closest("[data-day]"); if (!cell || !state.selectedId) return;
+  const p = currentMember(); if (!p) return;
   const ds = cell.dataset.day;
+  if (p.locked && p.locked[ds]) return;
   let action;
   if (state.markMode === "busy") action = (p.busy || []).includes(ds) ? "clearBusy" : "setBusy";
   else action = p.days.includes(ds) ? "clearFree" : "setFree";
@@ -655,11 +640,7 @@ function onDragMove(e) {
   const cell = el && el.closest ? el.closest("[data-day]") : null;
   if (!cell) return;
   const ds = cell.dataset.day;
-  if (!state.drag.moved) {
-    state.drag.moved = true;
-    paintDay(state.drag.startDs, state.drag.action);
-    state.drag.days.add(state.drag.startDs);
-  }
+  if (!state.drag.moved) { state.drag.moved = true; paintDay(state.drag.startDs, state.drag.action); state.drag.days.add(state.drag.startDs); }
   if (!state.drag.days.has(ds)) { paintDay(ds, state.drag.action); state.drag.days.add(ds); }
   e.preventDefault();
 }
@@ -669,171 +650,273 @@ async function onDragEnd() {
   window.removeEventListener("pointercancel", onDragEnd);
   const drag = state.drag; state.drag = null;
   if (!drag) return;
-  if (!drag.moved) { toggleDay(drag.startDs); return; } // a plain tap → cycle
-  const p = currentPerson();
+  if (!drag.moved) { toggleDay(drag.startDs); return; }
+  const p = currentMember();
   state.lastEditAt = Date.now();
   updateRoster(); updateResults();
-  if (p) await savePerson(p); // one write for the whole drag
+  if (p) await peopleUpdate(p);
 }
-
-/* ---- weekend / clear shortcuts (act on the visible month, for the selected person) ---- */
 async function markWeekends(pref) {
-  const p = currentPerson(); if (!p) return;
+  const p = currentMember(); if (!p) return;
   const y = state.view.getFullYear(), m = state.view.getMonth();
   const dim = new Date(y, m + 1, 0).getDate();
   const days = new Set(p.days), prefs = new Set(p.prefers || []), busy = new Set(p.busy || []);
   const reasons = { ...(p.busyReasons || {}) };
   for (let d = 1; d <= dim; d++) {
-    const dt = new Date(y, m, d), wd = dt.getDay();
-    if (wd === 0 || wd === 6) { const ds = fmt(dt); days.add(ds); busy.delete(ds); delete reasons[ds]; if (pref) prefs.add(ds); }
+    const dt = new Date(y, m, d), wd = dt.getDay(), ds = fmt(dt);
+    if ((wd === 0 || wd === 6) && !(p.locked && p.locked[ds])) { days.add(ds); busy.delete(ds); delete reasons[ds]; if (pref) prefs.add(ds); }
   }
   p.days = [...days]; p.prefers = [...prefs]; p.busy = [...busy]; p.busyReasons = reasons;
-  state.lastEditAt = Date.now();
-  updateRoster(); updateCalendar(); updateResults();
-  await savePerson(p);
+  state.lastEditAt = Date.now(); updateRoster(); updateCalendar(); updateResults(); await peopleUpdate(p);
+}
+async function markHolidays() {
+  const p = currentMember(); if (!p) return;
+  const y = state.view.getFullYear(), m = state.view.getMonth();
+  const dim = new Date(y, m + 1, 0).getDate(); const holis = phHolidays(y);
+  const days = new Set(p.days), busy = new Set(p.busy || []); const reasons = { ...(p.busyReasons || {}) };
+  let added = 0;
+  for (let d = 1; d <= dim; d++) { const ds = fmt(new Date(y, m, d));
+    if (holis[ds] && !(p.locked && p.locked[ds])) { days.add(ds); busy.delete(ds); delete reasons[ds]; added++; } }
+  if (!added) return;
+  p.days = [...days]; p.busy = [...busy]; p.busyReasons = reasons;
+  state.lastEditAt = Date.now(); updateRoster(); updateCalendar(); updateResults(); await peopleUpdate(p);
 }
 async function clearMonth() {
-  const p = currentPerson(); if (!p) return;
+  const p = currentMember(); if (!p) return;
   const y = state.view.getFullYear(), m = state.view.getMonth();
-  const dim = new Date(y, m + 1, 0).getDate();
-  const inMonth = new Set();
+  const dim = new Date(y, m + 1, 0).getDate(); const inMonth = new Set();
   for (let d = 1; d <= dim; d++) inMonth.add(fmt(new Date(y, m, d)));
   p.days = p.days.filter((ds) => !inMonth.has(ds));
   p.prefers = (p.prefers || []).filter((ds) => !inMonth.has(ds));
   p.busy = (p.busy || []).filter((ds) => !inMonth.has(ds));
-  const reasons = { ...(p.busyReasons || {}) };
-  for (const ds of inMonth) delete reasons[ds];
-  p.busyReasons = reasons;
-  state.lastEditAt = Date.now();
-  updateRoster(); updateCalendar(); updateResults();
-  await savePerson(p);
+  const reasons = { ...(p.busyReasons || {}) }; for (const ds of inMonth) delete reasons[ds]; p.busyReasons = reasons;
+  state.lastEditAt = Date.now(); updateRoster(); updateCalendar(); updateResults(); await peopleUpdate(p);
 }
 
-/* ---- rendering ---- */
-function dayInfo(ds) {
-  let free = 0, busy = 0; const bnames = [];
-  for (const p of state.people) {
-    const lk = p.locked && p.locked[ds];
-    if (lk) { busy++; bnames.push(`${p.name} (${lk})`); continue; }
-    if ((p.busy || []).includes(ds)) {
-      busy++;
-      const r = (p.busyReasons || {})[ds];
-      bnames.push(r ? `${p.name} (${r})` : p.name);
-    } else if (p.days.includes(ds)) free++;
-  }
-  let title = "";
-  if (free) title += `${free} free`;
-  if (busy) title += (title ? " · " : "") + "busy: " + bnames.join(", ");
-  return { free, busy, title };
-}
-function dayClass(free, busy, total) {
-  if (busy > 0) { const r = busy / total; return r >= 1 ? "b-all" : r >= 0.5 ? "b-some" : "b-few"; }
-  if (free > 0) { const r = free / total; return r === 1 ? "h-all" : r >= 0.75 ? "h-most" : r >= 0.5 ? "h-half" : "h-few"; }
-  return "h-none";
-}
-function cellInner(dnum, free, busy, myPref, locked) {
-  return `${myPref ? `<span class="star">&#9733;</span>` : ""}` +
-         `${busy ? `<span class="busytag">${busy}</span>` : ""}` +
-         `<span class="n">${dnum}</span>` +
-         `${free ? `<span class="c">${free}</span>` : ""}` +
-         `${locked ? `<span class="lock" title="Booked: ${escapeHtml(locked)}">&#128274;</span>` : ""}`;
-}
-
-// repaint a single calendar cell (used during drag, avoids rebuilding the grid)
-function updateDayCell(ds) {
-  const grid = document.getElementById("calGrid");
-  if (!grid) return;
-  const cell = grid.querySelector(`[data-day="${ds}"]`);
-  if (!cell) return;
-  const total = state.people.length;
-  const { free, busy, title } = dayInfo(ds);
-  const p = currentPerson();
-  const iLocked = p && p.locked && p.locked[ds];
-  const iFree = p && p.days.includes(ds) && !iLocked;
-  const iBusy = p && (p.busy || []).includes(ds);
-  const myPref = p && (p.prefers || []).includes(ds);
-  cell.className = `day ${dayClass(free, busy, total)} ${iFree ? "mine" : ""} ${(iBusy || iLocked) ? "mine-busy" : ""} ` +
-                  `${iLocked ? "locked" : ""} ${ds === fmt(new Date()) ? "today" : ""} ${p ? "" : "disabled"}`;
-  cell.title = title;
-  cell.innerHTML = cellInner(parse(ds).getDate(), free, busy, myPref, iLocked || "");
-}
-
-function personLi(p) {
-  const b = (p.busy || []).length, pr = (p.prefers || []).length;
+/* ================= app shell + tabs ================= */
+function boardHtml() {
+  const code = (state.cal || "").toUpperCase().split("").map((ch) => `<span class="flap-tile">${escapeHtml(ch)}</span>`).join("");
+  const name = state.calName ? escapeHtml(state.calName) : "Name this calendar";
   return `
-    <li class="person ${p.id === state.selectedId ? "active" : ""}">
+    <header class="board">
+      <div class="board-id">
+        <span class="plane">&#9992;</span>
+        <div>
+          <span class="eyebrow">Shared trip calendar</span>
+          <div class="tripname-row">
+            <span class="tripname ${state.calName ? "" : "placeholder"}" id="calNameEl">${name}</span>
+            <button class="editname" id="editCal" title="Rename">&#9998;</button>
+          </div>
+          <div class="flap" title="Calendar code">${code}</div>
+        </div>
+      </div>
+      <div class="board-actions">
+        <div class="tabs">
+          <button class="tab ${state.tab === "calendar" ? "on" : ""}" data-tab="calendar">Calendar</button>
+          <button class="tab ${state.tab === "trips" ? "on" : ""}" data-tab="trips">Trips${state.trips.length ? ` <span class="count">${state.trips.length}</span>` : ""}</button>
+        </div>
+        <button class="btn ghost" id="copyBtn">Invite link</button>
+      </div>
+    </header>`;
+}
+function wireBoard() {
+  document.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
+  const c = document.getElementById("copyBtn"); if (c) c.onclick = copyInvite;
+  const e = document.getElementById("editCal"); if (e) e.onclick = renameCal;
+}
+function switchTab(t) {
+  state.tab = t; state.openTrip = null;
+  render();
+}
+function updateCalNameEl() {
+  const el = document.getElementById("calNameEl"); if (!el) return;
+  el.textContent = state.calName ? state.calName : "Name this calendar";
+  el.classList.toggle("placeholder", !state.calName);
+}
+async function renameCal() {
+  const next = window.prompt("Name this calendar", state.calName || "");
+  if (next === null) return;
+  state.calName = next.trim().slice(0, 60); updateCalNameEl(); await calSetName(state.calName);
+}
+function copyInvite() {
+  const link = location.origin + location.pathname + "?cal=" + state.cal;
+  navigator.clipboard.writeText(link).then(() => {
+    const b = document.getElementById("copyBtn"); if (!b) return;
+    const t = b.textContent; b.textContent = "Copied!"; setTimeout(() => (b.textContent = t), 1500);
+  }).catch(() => prompt("Copy this invite link:", link));
+}
+
+function render() {
+  const app = document.getElementById("app");
+  if (state.mode === "landing") { renderLanding(); return; }
+  app.innerHTML = `<div class="wrap">${boardHtml()}<div id="main"></div></div>`;
+  wireBoard();
+  if (state.tab === "trips") renderTrips(); else renderCalendar();
+}
+
+/* ================= Calendar tab ================= */
+function renderCalendar() {
+  document.getElementById("main").innerHTML = `
+    <div class="grid">
+      <div>
+        <div class="card" id="whoCard">
+          <h2>Who's in <span class="count" id="peopleCount">0</span></h2>
+          <div class="row">
+            <input class="inp" id="nameInput" placeholder="Add a name" />
+            <button class="btn primary" id="addBtn">Add</button>
+          </div>
+          <ul id="roster"></ul>
+          <p class="hint">Tap a name, then mark the days they can (or can't) travel. Everyone shares this one calendar.</p>
+        </div>
+      </div>
+      <div>
+        <div class="card">
+          <div class="cal-head">
+            <button class="nav" id="prevM">&#8249;</button>
+            <span id="monthLabel"></span>
+            <button class="nav" id="nextM">&#8250;</button>
+          </div>
+          <p id="calHint"></p>
+          <div class="markbar">
+            <span class="lab">I'm marking:</span>
+            <div class="seg mode" id="markMode">
+              <button data-mark="free" class="on">Free</button>
+              <button data-mark="busy">Busy</button>
+            </div>
+            <span class="reasonwrap" id="reasonBar" hidden>
+              <span class="lab">Reason:</span>
+              <div class="seg reason" id="reasonSeg">
+                <button data-reason="work">Work</button>
+                <button data-reason="family">Family</button>
+                <button data-reason="other">Other</button>
+              </div>
+            </span>
+          </div>
+          <div class="shortcuts" id="shortcuts">
+            <button class="btn small" id="wkFree">Weekends free</button>
+            <button class="btn small" id="wkPref">Weekends &#9733;</button>
+            <button class="btn small" id="phHol">PH holidays free</button>
+            <button class="btn small" id="clrMonth">Clear month</button>
+          </div>
+          <div class="weekdays"><div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div></div>
+          <div class="cal-grid" id="calGrid"></div>
+          <div class="legend">
+            <span><span class="sw" style="background:#22c55e"></span>everyone free</span>
+            <span><span class="sw" style="background:#86efac"></span>most free</span>
+            <span><span class="sw" style="background:#f43f5e"></span>someone busy</span>
+            <span><span style="color:var(--amber-deep);font-size:11px">&#9733;</span> preferred</span>
+            <span><span class="sw" style="background:#6366f1;width:8px;height:8px;border-radius:50%"></span>PH holiday</span>
+            <span>&#128274; on a trip</span>
+          </div>
+        </div>
+        <div class="card">
+          <h2>What counts as a match</h2>
+          <label class="field"><span>Shortest trip (nights in a row)</span>
+            <input class="inp num" type="number" id="minLen" min="1" value="${state.minLen}" /></label>
+          <label class="field"><span>People who can miss it</span>
+            <input class="inp num" type="number" id="maxDrop" min="0" value="${state.maxDrop}" />
+            <span class="hint">0 = nobody can miss the trip.</span></label>
+          <label class="field"><span>Count someone as available when&hellip;</span>
+            <div class="seg avail" id="availSeg">
+              <button data-avail="notbusy" class="${state.availMode === "notbusy" ? "on" : ""}">they're not busy</button>
+              <button data-avail="free" class="${state.availMode === "free" ? "on" : ""}">they marked free</button>
+            </div></label>
+        </div>
+        <div class="card">
+          <h2>Windows that work</h2>
+          <div id="results"></div>
+          <p class="footnote">Found dates that suit everyone? Hit <b>Make this a trip</b> — name it, pick who's going, and those days lock onto the calendar so they won't clash with future plans.</p>
+        </div>
+      </div>
+    </div>`;
+
+  updateRoster(); updateCalendar(); updateResults();
+
+  document.getElementById("addBtn").onclick = addMember;
+  document.getElementById("nameInput").addEventListener("keydown", (e) => { if (e.key === "Enter") addMember(); });
+  document.getElementById("prevM").onclick = () => { state.view = new Date(state.view.getFullYear(), state.view.getMonth() - 1, 1); updateCalendar(); };
+  document.getElementById("nextM").onclick = () => { state.view = new Date(state.view.getFullYear(), state.view.getMonth() + 1, 1); updateCalendar(); };
+  document.getElementById("minLen").addEventListener("input", (e) => { state.minLen = Math.max(1, +e.target.value || 1); updateResults(); });
+  document.getElementById("maxDrop").addEventListener("input", (e) => { state.maxDrop = Math.max(0, +e.target.value || 0); updateResults(); });
+  document.getElementById("wkFree").onclick = () => markWeekends(false);
+  document.getElementById("wkPref").onclick = () => markWeekends(true);
+  document.getElementById("phHol").onclick = markHolidays;
+  document.getElementById("clrMonth").onclick = clearMonth;
+  document.getElementById("markMode").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-mark]"); if (!b) return;
+    state.markMode = b.dataset.mark;
+    document.querySelectorAll("#markMode button").forEach((x) => x.classList.toggle("on", x === b));
+    const rb = document.getElementById("reasonBar"); if (rb) rb.hidden = !(state.selectedId && state.markMode === "busy");
+    updateCalendar();
+  });
+  document.getElementById("reasonSeg").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-reason]"); if (!b) return;
+    const same = state.busyReason === b.dataset.reason;
+    state.busyReason = same ? null : b.dataset.reason;
+    document.querySelectorAll("#reasonSeg button").forEach((x) => x.classList.toggle("on", !same && x === b));
+  });
+  document.getElementById("availSeg").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-avail]"); if (!b) return;
+    state.availMode = b.dataset.avail;
+    document.querySelectorAll("#availSeg button").forEach((x) => x.classList.toggle("on", x === b));
+    updateResults();
+  });
+  document.getElementById("whoCard").addEventListener("click", (e) => {
+    const pick = e.target.closest("[data-select]"); const del = e.target.closest("[data-remove]");
+    if (del) return removeMember(del.dataset.remove);
+    if (pick) { state.selectedId = pick.dataset.select; updateRoster(); updateCalendar();
+      const rb = document.getElementById("reasonBar"); if (rb) rb.hidden = !(state.selectedId && state.markMode === "busy"); }
+  });
+  document.getElementById("results").addEventListener("click", (e) => {
+    const mk = e.target.closest("[data-make]"); if (mk) { const [f, t] = mk.dataset.make.split("|"); makeTrip(f, t); }
+  });
+  document.getElementById("calGrid").addEventListener("pointerdown", onCalPointerDown);
+}
+
+function updateRoster() {
+  const pc = document.getElementById("peopleCount"); if (pc) pc.textContent = state.members.length;
+  const ul = document.getElementById("roster"); if (!ul) return;
+  ul.innerHTML = state.members.length ? state.members.map((p) => {
+    const b = (p.busy || []).length, pr = (p.prefers || []).length;
+    return `<li class="person ${p.id === state.selectedId ? "active" : ""}">
       <button class="pick" data-select="${p.id}">
         <span class="name">${escapeHtml(p.name)}</span>
-        <span class="tally">
-          <span class="f">${p.days.length} free</span>
-          ${b ? `<span class="b">${b} busy</span>` : ""}
-          ${pr ? `<span class="p">&#9733;${pr}</span>` : ""}
-        </span>
+        <span class="tally"><span class="f">${p.days.length} free</span>${b ? `<span class="b">${b} busy</span>` : ""}${pr ? `<span class="p">&#9733;${pr}</span>` : ""}</span>
       </button>
-      <button class="del" data-remove="${p.id}" title="${state.group ? "Remove from this trip" : "Remove"}">&times;</button>
-    </li>`;
+      <button class="del" data-remove="${p.id}" title="Remove">&times;</button></li>`;
+  }).join("") : `<li class="empty">Add everyone first, then tap a name to mark their days.</li>`;
 }
-function updateRoster() {
-  document.getElementById("peopleCount").textContent = state.people.length;
-  const body = document.getElementById("whoBody");
-  if (!body) return;
-
-  if (state.group) {
-    const onTrip = new Set(state.people.map((p) => p.member_id).filter(Boolean));
-    const notOn = state.members.filter((m) => !onTrip.has(m.id));
-    const going = state.people.length
-      ? `<ul id="roster">${state.people.map(personLi).join("")}</ul>`
-      : `<p class="hint">Nobody's on this trip yet — add people from your group below.</p>`;
-    const addFromGroup = notOn.length
-      ? `<p class="subhead">In the group</p>
-         <ul class="addlist">${notOn.map((m) =>
-            `<li><button data-addmember="${m.id}">+ ${escapeHtml(m.name)}</button></li>`).join("")}</ul>`
-      : "";
-    body.innerHTML = `
-      ${going}
-      ${addFromGroup}
-      <p class="subhead">New person</p>
-      <div class="row">
-        <input class="inp" id="nameInput" placeholder="Add someone to the group" />
-        <button class="btn primary" data-addbtn>Add</button>
-      </div>`;
-  } else {
-    const list = state.people.length
-      ? `<ul id="roster">${state.people.map(personLi).join("")}</ul>`
-      : `<ul id="roster"><li class="empty">Add everyone first, then tap a name to mark their free or busy days.</li></ul>`;
-    body.innerHTML = `
-      <div class="row">
-        <input class="inp" id="nameInput" placeholder="Add a friend's name" />
-        <button class="btn primary" data-addbtn>Add</button>
-      </div>
-      ${list}`;
-  }
+async function addMember() {
+  const input = document.getElementById("nameInput"); const name = input.value.trim(); if (!name) return;
+  input.value = "";
+  const row = await peopleAdd(name); if (!row) return;
+  state.members = [...state.members, row].sort((a, b) => a.name.localeCompare(b.name));
+  state.selectedId = row.id;
+  updateRoster(); updateCalendar(); updateResults();
+}
+async function removeMember(id) {
+  state.members = state.members.filter((m) => m.id !== id);
+  if (state.selectedId === id) state.selectedId = state.members[0]?.id ?? null;
+  // drop from any trip's going list
+  for (const t of state.trips) { if ((t.going || []).includes(id)) { t.going = t.going.filter((g) => g !== id); tripUpdate(t.id, { going: t.going }); } }
+  applyTripOverlay();
+  updateRoster(); updateCalendar(); updateResults();
+  await peopleDelete(id);
 }
 
 function updateCalendar() {
-  const total = state.people.length;
+  const total = state.members.length;
   const y = state.view.getFullYear(), m = state.view.getMonth();
-  document.getElementById("monthLabel").textContent =
-    state.view.toLocaleString("en-US", { month: "long", year: "numeric" });
-
-  const selected = state.people.find((p) => p.id === state.selectedId) || null;
+  document.getElementById("monthLabel").textContent = state.view.toLocaleString("en-US", { month: "long", year: "numeric" });
+  const selected = currentMember();
   const painting = state.markMode === "busy"
-    ? `<b>busy</b> days — tap or drag to block them off`
-    : `<b>free</b> days — tap once for free, twice for prefer &#9733;, drag to fill`;
-  document.getElementById("calHint").innerHTML = selected
-    ? `Marking <b>${escapeHtml(selected.name)}</b>'s ${painting}`
-    : `Pick someone on the left to start marking days`;
-
-  const sc = document.getElementById("shortcuts");
-  if (sc) sc.querySelectorAll("button").forEach((b) => (b.disabled = !selected));
-  const mm = document.getElementById("markMode");
-  if (mm) mm.querySelectorAll("button").forEach((b) => (b.disabled = !selected));
-  const rb = document.getElementById("reasonBar");
-  if (rb) rb.hidden = !(selected && state.markMode === "busy");
-
-  const startWd = new Date(y, m, 1).getDay();
-  const dim = new Date(y, m + 1, 0).getDate();
-  const today = fmt(new Date());
+    ? `<b>busy</b> days — pick a reason if you like, then tap or drag. It shows on the day.`
+    : `<b>free</b> days — tap once free, twice prefer &#9733;, drag to fill`;
+  document.getElementById("calHint").innerHTML = selected ? `Marking <b>${escapeHtml(selected.name)}</b>'s ${painting}` : `Pick someone on the left to start marking days`;
+  const sc = document.getElementById("shortcuts"); if (sc) sc.querySelectorAll("button").forEach((b) => (b.disabled = !selected));
+  const mm = document.getElementById("markMode"); if (mm) mm.querySelectorAll("button").forEach((b) => (b.disabled = !selected));
+  const rb = document.getElementById("reasonBar"); if (rb) rb.hidden = !(selected && state.markMode === "busy");
+  const startWd = new Date(y, m, 1).getDay(), dim = new Date(y, m + 1, 0).getDate(), today = fmt(new Date());
   let html = "";
   for (let i = 0; i < startWd; i++) html += `<div></div>`;
   for (let d = 1; d <= dim; d++) {
@@ -843,693 +926,254 @@ function updateCalendar() {
     const iFree = selected && selected.days.includes(ds) && !iLocked;
     const iBusy = selected && (selected.busy || []).includes(ds);
     const myPref = selected && (selected.prefers || []).includes(ds);
-    html += `<button class="day ${dayClass(f, b, total)} ${iFree ? "mine" : ""} ${(iBusy || iLocked) ? "mine-busy" : ""} ${iLocked ? "locked" : ""} ${ds === today ? "today" : ""} ${selected ? "" : "disabled"}" data-day="${ds}" ${title ? `title="${escapeHtml(title)}"` : ""} ${selected ? "" : "disabled"}>
-      ${cellInner(d, f, b, myPref, iLocked || "")}
-    </button>`;
+    const myReason = (iBusy && !iLocked) ? (selected.busyReasons || {})[ds] : "";
+    const holi = holidayName(ds);
+    html += `<button class="day ${dayClass(f, b, total)} ${iFree ? "mine" : ""} ${(iBusy || iLocked) ? "mine-busy" : ""} ${iLocked ? "locked" : ""} ${holi ? "holi" : ""} ${ds === today ? "today" : ""} ${selected ? "" : "disabled"}" data-day="${ds}" ${title ? `title="${escapeHtml(title)}"` : ""} ${selected ? "" : "disabled"}>${cellInner(d, f, b, myPref, iLocked || "", myReason || "")}</button>`;
   }
   document.getElementById("calGrid").innerHTML = html;
 }
 
 function updateResults() {
-  const total = state.people.length;
+  const total = state.members.length;
   const { windows, noConflict, hasMarks } = computeWindows();
-  const box = document.getElementById("results");
+  const box = document.getElementById("results"); if (!box) return;
   let body;
-  if (!total) {
-    body = `<p class="hint">Add people, then mark days to see what fits.</p>`;
-  } else if (!hasMarks) {
-    body = `<p class="hint">Mark some days — free or busy — and the windows that work will show up here.</p>`;
-  } else if (!windows.length) {
-    body = `<p class="hint">Nothing fits with these settings. Try a shorter minimum length, or allow more people to miss it.</p>`;
-  } else {
+  if (!total) body = `<p class="hint">Add people, then mark days to see what fits.</p>`;
+  else if (!hasMarks) body = `<p class="hint">Mark some days — free or busy — and the windows that work show up here.</p>`;
+  else if (!windows.length) body = `<p class="hint">Nothing fits with these settings. Try a shorter minimum, or allow more people to miss it.</p>`;
+  else {
     const strict = state.availMode === "free";
-    const inGroup = !!state.group;
-    body = "";
-    if (inGroup && state.lockFrom) {
-      body += `<div class="lockbar">
-        <span>Locked in: <span class="rng">${prettyRange(state.lockFrom, state.lockTo)}</span> — blocked in your other trips</span>
-        <button class="btn small" data-unlock>Unlock</button>
-      </div>`;
-    }
-    body += "<ul>" + windows.map((w) => {
+    body = "<ul>" + windows.map((w) => {
       const clear = w.busy.length === 0 && (!strict || w.unconfirmed.length === 0);
       let note;
       if (clear) note = "no conflicts";
       else {
         const parts = [];
-        if (w.busy.length) {
-          const names = w.busy.map((b) =>
-            escapeHtml(b.name) + (b.reasons.length ? ` (${b.reasons.map(escapeHtml).join(", ")})` : ""));
-          parts.push("busy: " + names.join(", "));
-        }
+        if (w.busy.length) parts.push("busy: " + w.busy.map((b) => escapeHtml(b.name) + (b.reasons.length ? ` (${b.reasons.map(escapeHtml).join(", ")})` : "")).join(", "));
         if (strict && w.unconfirmed.length) parts.push("not confirmed: " + w.unconfirmed.map(escapeHtml).join(", "));
         note = parts.join(" · ");
       }
-      const isLocked = inGroup && state.lockFrom === w.from && state.lockTo === w.to;
       return `<li class="win ${clear ? "clear" : ""}">
         <div>
           <div class="range">${prettyRange(w.from, w.to)}</div>
           <div class="meta">${w.len} day${w.len === 1 ? "" : "s"} in a row &middot; ${note}</div>
-          ${inGroup ? `<button class="btn small lockbtn" ${isLocked ? "disabled" : ""} data-lock="${w.from}|${w.to}">${isLocked ? "Locked" : "Lock these dates"}</button>` : ""}
+          <button class="btn small lockbtn" data-make="${w.from}|${w.to}">Make this a trip</button>
         </div>
-        <div class="tags">
-          ${w.preferred ? `<span class="badge pref">&#9733; preferred</span>` : ""}
-          ${clear ? `<span class="badge clear">clear</span>` : ""}
-        </div>
+        <div class="tags">${w.preferred ? `<span class="badge pref">&#9733; preferred</span>` : ""}${clear ? `<span class="badge clear">clear</span>` : ""}</div>
       </li>`;
     }).join("") + "</ul>";
-    if (noConflict > 0) {
-      body += `<p class="summary"><b>${noConflict}</b> day${noConflict === 1 ? "" : "s"} in range ` +
-              `${noConflict === 1 ? "has" : "have"} nobody marked busy.</p>`;
-    }
+    if (noConflict > 0) body += `<p class="summary"><b>${noConflict}</b> day${noConflict === 1 ? "" : "s"} in range ${noConflict === 1 ? "has" : "have"} nobody marked busy.</p>`;
   }
   box.innerHTML = body;
 }
 
-function updateAll() { updateRoster(); updateCalendar(); updateResults(); }
-
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-/* ---- planner shell ---- */
-function renderPlanner() {
-  document.getElementById("app").innerHTML = `
-    <div class="wrap">
-      ${headerHtml("schedule")}
-
-      <div class="grid">
-        <div>
-          <div class="card" id="whoCard">
-            <h2>Who's going <span class="count" id="peopleCount">0</span></h2>
-            <div id="whoBody"></div>
-          </div>
-
-          <div class="card">
-            <h2>What counts as a match</h2>
-            <label class="field">
-              <span>Minimum trip length (days)</span>
-              <input class="inp num" type="number" id="minLen" min="1" max="60" value="1" />
-              <span class="hint">Leave at 1 to see every window that works.</span>
-            </label>
-            <label class="field">
-              <span>People who can miss it</span>
-              <input class="inp num" type="number" id="maxDrop" min="0" value="0" />
-              <span class="hint">0 = nobody can miss the trip.</span>
-            </label>
-            <label class="field">
-              <span>Count someone as available when…</span>
-              <div class="seg avail" id="availSeg">
-                <button data-avail="notbusy" class="on">they're not busy</button>
-                <button data-avail="free">they marked free</button>
-              </div>
-              <span class="hint">"Not busy" lets people just block the days they can't go. "Marked free" only counts confirmed days.</span>
-            </label>
-          </div>
-        </div>
-
-        <div>
-          <div class="card">
-            <div class="cal-head">
-              <button class="nav" id="prevBtn">&#8249;</button>
-              <span id="monthLabel"></span>
-              <button class="nav" id="nextBtn">&#8250;</button>
-            </div>
-            <p id="calHint"></p>
-            <div class="markbar">
-              <span class="lab">I'm marking:</span>
-              <div class="seg mode" id="markMode">
-                <button data-mark="free" class="on">Free</button>
-                <button data-mark="busy">Busy</button>
-              </div>
-              <span class="reasonwrap" id="reasonBar" hidden>
-                <span class="lab">Reason:</span>
-                <div class="seg reason" id="reasonSeg">
-                  <button data-reason="work">Work</button>
-                  <button data-reason="family">Family</button>
-                  <button data-reason="other">Other</button>
-                </div>
-              </span>
-            </div>
-            <div class="shortcuts" id="shortcuts">
-              <button class="btn small" id="wkFree">Weekends free</button>
-              <button class="btn small" id="wkPref">Weekends &#9733;</button>
-              <button class="btn small" id="clrMonth">Clear month</button>
-            </div>
-            <div class="weekdays"><div>S</div><div>M</div><div>T</div><div>W</div><div>T</div><div>F</div><div>S</div></div>
-            <div class="cal-grid" id="calGrid"></div>
-            <div class="legend">
-              <span><span class="sw" style="background:#22c55e"></span>everyone free</span>
-              <span><span class="sw" style="background:#86efac"></span>most free</span>
-              <span><span class="sw" style="background:#f43f5e"></span>someone busy</span>
-              <span><span style="color:var(--amber-deep);font-size:11px">&#9733;</span> preferred</span>
-            </div>
-          </div>
-
-          <div class="card">
-            <h2>Windows that work</h2>
-            <div id="results"></div>
-          </div>
-
-          <p class="footnote">Dates and preferences live here in the clear. Passport-type details for booking go in the <b>Booking</b> tab, where they're encrypted.</p>
-        </div>
-      </div>
-    </div>`;
-
-  // static listeners
-  document.getElementById("minLen").addEventListener("input", (e) => {
-    state.minLen = Math.max(1, Number(e.target.value) || 1); updateResults();
-  });
-  document.getElementById("maxDrop").addEventListener("input", (e) => {
-    state.maxDrop = Math.max(0, Number(e.target.value) || 0); updateResults();
-  });
-  document.getElementById("prevBtn").onclick = () => { state.view = new Date(state.view.getFullYear(), state.view.getMonth() - 1, 1); updateCalendar(); };
-  document.getElementById("nextBtn").onclick = () => { state.view = new Date(state.view.getFullYear(), state.view.getMonth() + 1, 1); updateCalendar(); };
-  document.getElementById("wkFree").onclick = () => markWeekends(false);
-  document.getElementById("wkPref").onclick = () => markWeekends(true);
-  document.getElementById("clrMonth").onclick = clearMonth;
-  document.getElementById("markMode").addEventListener("click", (e) => {
-    const b = e.target.closest("[data-mark]"); if (!b) return;
-    state.markMode = b.dataset.mark;
-    document.querySelectorAll("#markMode button").forEach((x) => x.classList.toggle("on", x === b));
-    const rb = document.getElementById("reasonBar");
-    if (rb) rb.hidden = !(state.selectedId && state.markMode === "busy");
-    updateCalendar();
-  });
-  document.getElementById("reasonSeg").addEventListener("click", (e) => {
-    const b = e.target.closest("[data-reason]"); if (!b) return;
-    const same = state.busyReason === b.dataset.reason;
-    state.busyReason = same ? null : b.dataset.reason;   // click again to clear
-    document.querySelectorAll("#reasonSeg button").forEach((x) =>
-      x.classList.toggle("on", !same && x === b));
-  });
-  document.getElementById("availSeg").addEventListener("click", (e) => {
-    const b = e.target.closest("[data-avail]"); if (!b) return;
-    state.availMode = b.dataset.avail;
-    document.querySelectorAll("#availSeg button").forEach((x) => x.classList.toggle("on", x === b));
-    updateResults();
-  });
-  wireHeader();
-
-  // delegated listeners
-  document.getElementById("whoCard").addEventListener("click", (e) => {
-    const pick = e.target.closest("[data-select]");
-    const del = e.target.closest("[data-remove]");
-    const addm = e.target.closest("[data-addmember]");
-    const addb = e.target.closest("[data-addbtn]");
-    if (del) return removePerson(del.dataset.remove);
-    if (addm) return addMemberToTrip(addm.dataset.addmember);
-    if (addb) return addPerson();
-    if (pick) { state.selectedId = pick.dataset.select; updateRoster(); updateCalendar(); }
-  });
-  document.getElementById("whoCard").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && e.target.id === "nameInput") addPerson();
-  });
-  document.getElementById("results").addEventListener("click", (e) => {
-    const lock = e.target.closest("[data-lock]");
-    const unlock = e.target.closest("[data-unlock]");
-    if (lock) { const [f, t] = lock.dataset.lock.split("|"); return lockTrip(f, t); }
-    if (unlock) return unlockTrip();
-  });
-  // pointerdown drives both a plain tap (cycle) and a drag (fill a range)
-  document.getElementById("calGrid").addEventListener("pointerdown", onCalPointerDown);
-
-  updateAll();
-}
-async function lockTrip(from, to) {
-  state.lockFrom = from; state.lockTo = to;
-  const t = state.groupTrips.find((x) => x.room === state.room);
-  if (t) { t.lock_from = from; t.lock_to = to; }
-  updateResults();
-  await tripSetLock(state.room, from, to);
-}
-async function unlockTrip() {
-  state.lockFrom = null; state.lockTo = null;
-  const t = state.groupTrips.find((x) => x.room === state.room);
-  if (t) { t.lock_from = null; t.lock_to = null; }
-  updateResults();
-  await tripSetLock(state.room, null, null);
-}
-
-function copyLink(kind, code, btnId) {
-  const link = location.origin + location.pathname + "?" + kind + "=" + code;
-  navigator.clipboard.writeText(link).then(() => {
-    const b = document.getElementById(btnId);
-    if (!b) return;
-    const t = b.textContent; b.textContent = "Copied!";
-    setTimeout(() => (b.textContent = t), 1500);
-  }).catch(() => prompt("Copy this invite link:", link));
-}
-function copyInvite() { copyLink("room", state.room, "copyBtn"); }
-function copyGroupInvite() { copyLink("group", state.group, "gCopyBtn"); }
-
-/* ---- shared header + tabs ---- */
-function headerHtml(active) {
-  const code = (state.room || "").toUpperCase().split("")
-    .map((ch) => `<span class="flap-tile">${escapeHtml(ch)}</span>`).join("");
-  const name = state.tripName ? escapeHtml(state.tripName) : "Name this trip";
-  return `
-    <header class="board">
-      <div class="board-id">
-        <span class="plane">&#9992;</span>
-        <div>
-          <span class="eyebrow">Trip Planner</span>
-          <div class="tripname-row">
-            <span class="tripname ${state.tripName ? "" : "placeholder"}" id="tripName">${name}</span>
-            <button class="editname" id="editName" title="Rename trip">&#9998;</button>
-          </div>
-          <div class="flap" title="Trip code">${code}</div>
-        </div>
-      </div>
-      <div class="board-actions">
-        ${state.group ? `<button class="btn ghost" id="groupBtn" title="Back to your group">&#8592; Group</button>` : ""}
-        <div class="tabs">
-          <button class="tab ${active === "schedule" ? "on" : ""}" data-tab="schedule">Schedule</button>
-          <button class="tab ${active === "booking" ? "on" : ""}" data-tab="booking">Booking</button>
-        </div>
-        <button class="btn ghost" id="copyBtn">Invite link</button>
-      </div>
-    </header>`;
-}
-function updateBoardName() {
-  const el = document.getElementById("tripName");
-  if (!el) return;
-  el.textContent = state.tripName ? state.tripName : "Name this trip";
-  el.classList.toggle("placeholder", !state.tripName);
-}
-async function renameTrip() {
-  const next = window.prompt("Name this trip", state.tripName || "");
-  if (next === null) return;
-  state.tripName = next.trim().slice(0, 60);
-  updateBoardName();
-  await tripSetName(state.tripName);
-}
-function wireHeader() {
-  document.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
-  const c = document.getElementById("copyBtn");
-  if (c) c.onclick = copyInvite;
-  const e = document.getElementById("editName");
-  if (e) e.onclick = renameTrip;
-  const g = document.getElementById("groupBtn");
-  if (g) g.onclick = () => { location.search = "?group=" + encodeURIComponent(state.group); };
-}
-function switchTab(t) {
-  if (state.tab === t) return;
-  state.tab = t;
+async function makeTrip(from, to) {
+  // default "who's going" = everyone free across the whole span (no busy, not already on a trip)
+  const span = []; for (let d = parse(from); d <= parse(to); d = addDays(d, 1)) span.push(fmt(d));
+  const going = state.members.filter((m) => span.every((ds) => !(m.busy || []).includes(ds) && !(m.locked && m.locked[ds]))).map((m) => m.id);
+  const name = (window.prompt(`Name this trip (${prettyRange(from, to)})`, "") || "").trim().slice(0, 60);
+  const trip = await tripAdd(name, from, to, going);
+  if (!trip) return;
+  state.trips = [...state.trips, trip].sort((a, b) => a.date_from.localeCompare(b.date_from));
+  applyTripOverlay();
+  state.tab = "trips"; state.openTrip = trip.id;
   render();
-  if (t === "booking") loadBookings();
-}
-function render() {
-  if (state.tab === "booking") renderBooking();
-  else renderPlanner();
 }
 
-/* ---- booking view ---- */
-const fmtDetail = (d) =>
-  `${d.fullName || ""} | DOB ${d.dob || "?"}${d.nationality ? " | " + d.nationality : ""}` +
-  `${d.passport ? " | Passport " + d.passport : ""}${d.expiry ? " exp " + d.expiry : ""}` +
-  `${d.notes ? " | " + d.notes : ""}`;
-
-function renderBooking() {
-  document.getElementById("app").innerHTML = `
-    <div class="wrap">
-      ${headerHtml("booking")}
-      <div class="notice">
-        <b>How this works.</b> Your details are encrypted right here in your browser using a passphrase your group agrees on — share that passphrase in your group chat or in person, never anywhere it gets stored. Only someone with the passphrase can read what's saved, and if it's lost the data can't be recovered. Fill in only what your trip needs; passport fields are for international flights.
-      </div>
-      <div class="grid">
-        <div>
-          <div class="card">
-            <h2>Add your details</h2>
-            <label class="field"><span>Full name (as on passport / ID)</span><input class="inp" id="bkFull" /></label>
-            <div class="fgrid">
-              <label class="field"><span>Date of birth</span><input class="inp" id="bkDob" placeholder="YYYY-MM-DD" /></label>
-              <label class="field"><span>Nationality</span><input class="inp" id="bkNat" /></label>
-            </div>
-            <div class="fgrid">
-              <label class="field"><span>Passport number</span><input class="inp" id="bkPassport" /></label>
-              <label class="field"><span>Passport expiry</span><input class="inp" id="bkExp" placeholder="YYYY-MM-DD" /></label>
-            </div>
-            <label class="field"><span>Notes (frequent flyer #, contact, seat)</span><input class="inp" id="bkNotes" /></label>
-            <label class="field"><span>Trip passphrase</span><input class="inp" type="password" id="bkPass" placeholder="the one your group agreed on" /></label>
-            <button class="btn primary" id="bkSave">Save my details</button>
-            <p class="hint" id="bkMsg"></p>
-          </div>
-        </div>
-        <div>
-          <div class="card">
-            <h2>Submitted <span class="count" id="bkCount">0</span></h2>
-            <ul id="bkList" style="list-style:none;margin:14px 0 0;padding:0;display:flex;flex-direction:column;gap:6px;"></ul>
-          </div>
-          <div class="card">
-            <h2>Booking — unlock everyone</h2>
-            <p class="hint" style="margin-bottom:10px;">For whoever's booking. Enter the same passphrase to reveal all details to copy into the airline site.</p>
-            <div class="row">
-              <input class="inp" type="password" id="bkUnlockPass" placeholder="Trip passphrase" />
-              <button class="btn" id="bkUnlockBtn">Unlock</button>
-            </div>
-            <div id="bkReveal"></div>
-            <button class="btn danger small" id="bkDeleteAll" style="margin-top:14px;">Delete all details after booking</button>
-          </div>
-        </div>
-      </div>
-    </div>`;
-  wireHeader();
-  document.getElementById("bkSave").onclick = bkSave;
-  document.getElementById("bkUnlockBtn").onclick = bkUnlock;
-  document.getElementById("bkUnlockPass").addEventListener("keydown", (e) => { if (e.key === "Enter") bkUnlock(); });
-  document.getElementById("bkDeleteAll").onclick = async () => {
-    if (!confirm("Delete everyone's booking details for this trip? This can't be undone.")) return;
-    await bkDeleteAll(); await loadBookings();
-    const out = document.getElementById("bkReveal"); if (out) out.innerHTML = `<p class="hint ok">All details deleted.</p>`;
-  };
-  document.getElementById("bkList").addEventListener("click", async (e) => {
-    const del = e.target.closest("[data-bkdel]"); if (!del) return;
-    await bkDelete(del.dataset.bkdel); await loadBookings();
-  });
-  updateBkList();
-}
-
-async function loadBookings() {
-  const rows = await bkFetch();
-  if (rows) { state.bookings = rows; updateBkList(); }
-}
-function updateBkList() {
-  const list = document.getElementById("bkList");
-  if (!list) return;
-  const count = document.getElementById("bkCount");
-  if (count) count.textContent = state.bookings.length;
-  if (!state.bookings.length) { list.innerHTML = `<li class="empty">No one has added details yet.</li>`; return; }
-  list.innerHTML = state.bookings.map((b) => `
-    <li class="person">
-      <span class="name" style="flex:1;">${escapeHtml(b.name)} <span class="ok">&#10003;</span></span>
-      <button class="del" data-bkdel="${b.id}" title="Remove">&times;</button>
-    </li>`).join("");
-}
-
-async function bkSave() {
-  const msg = document.getElementById("bkMsg");
-  const setMsg = (t, cls) => { msg.textContent = t; msg.className = "hint" + (cls ? " " + cls : ""); };
-  if (!cryptoReady()) return setMsg("Encryption needs a secure page — open this over http://localhost or your https:// site.", "fail");
-  const val = (id) => document.getElementById(id).value.trim();
-  const name = val("bkFull"), dob = val("bkDob"), pass = document.getElementById("bkPass").value;
-  if (!name || !dob) return setMsg("Full name and date of birth are required.", "fail");
-  if (!pass) return setMsg("Enter the trip passphrase your group agreed on.", "fail");
-  const details = { fullName: name, dob, nationality: val("bkNat"), passport: val("bkPassport"), expiry: val("bkExp"), notes: val("bkNotes") };
-  setMsg("Encrypting…");
-  try {
-    const blob = await encryptJSON(details, pass);
-    const ok = await bkUpsert(name, blob);
-    if (!ok) return setMsg("Couldn't save — check your connection.", "fail");
-    document.getElementById("bkPass").value = "";
-    setMsg("Saved and encrypted. Only the trip passphrase can read it.", "ok");
-    await loadBookings();
-  } catch (e) { setMsg("Encryption failed: " + e.message, "fail"); }
-}
-
-async function bkUnlock() {
-  const out = document.getElementById("bkReveal");
-  if (!cryptoReady()) { out.innerHTML = `<p class="fail">Encryption needs http://localhost or an https:// site.</p>`; return; }
-  const pass = document.getElementById("bkUnlockPass").value;
-  if (!pass) { out.innerHTML = `<p class="hint">Enter the trip passphrase.</p>`; return; }
-  if (!state.bookings.length) { out.innerHTML = `<p class="hint">No details submitted yet.</p>`; return; }
-  out.innerHTML = `<p class="hint">Unlocking…</p>`;
-  const ok = [], fail = [];
-  for (const b of state.bookings) {
-    try { ok.push({ name: b.name, d: await decryptJSON(b.blob, pass) }); }
-    catch (e) { fail.push(b.name); }
-  }
-  let html = "";
-  if (ok.length) {
-    html += `<table class="rev"><thead><tr><th>Name</th><th>DOB</th><th>Nationality</th><th>Passport</th><th>Expiry</th><th>Notes</th><th></th></tr></thead><tbody>`;
-    html += ok.map(({ name, d }) => `<tr>
-        <td>${escapeHtml(d.fullName || name)}</td><td>${escapeHtml(d.dob || "")}</td>
-        <td>${escapeHtml(d.nationality || "")}</td><td>${escapeHtml(d.passport || "")}</td>
-        <td>${escapeHtml(d.expiry || "")}</td><td>${escapeHtml(d.notes || "")}</td>
-        <td><button class="btn small" data-copy="${escapeHtml(JSON.stringify(d))}">Copy</button></td>
-      </tr>`).join("");
-    html += `</tbody></table><button class="btn small" id="copyAll" style="margin-top:10px;">Copy all</button>`;
-  }
-  if (fail.length) html += `<p class="fail">Couldn't unlock: ${fail.map(escapeHtml).join(", ")} — likely saved with a different passphrase.</p>`;
-  html += `<p class="hint">Shown only on your screen. Close the tab when you're done, and delete the details after booking.</p>`;
-  out.innerHTML = html;
-  out.querySelectorAll("[data-copy]").forEach((btn) => (btn.onclick = () => {
-    navigator.clipboard.writeText(fmtDetail(JSON.parse(btn.dataset.copy)));
-    btn.textContent = "Copied"; setTimeout(() => (btn.textContent = "Copy"), 1200);
-  }));
-  const all = document.getElementById("copyAll");
-  if (all) all.onclick = () => {
-    navigator.clipboard.writeText(ok.map(({ d }) => fmtDetail(d)).join("\n"));
-    all.textContent = "Copied all"; setTimeout(() => (all.textContent = "Copy all"), 1200);
-  };
-}
-
-/* ---- polling (keeps everyone in sync, no extra setup) ---- */
-async function poll() {
-  if (!sb || document.visibilityState !== "visible") return;
-
-  if (state.mode === "group") {                 // hub: refresh roster + trip list
-    state.members = await membersFetch(state.group);
-    state.groupTrips = await tripsByGroup(state.group);
-    updateMembers(); updateTripsList();
+/* ================= Trips tab ================= */
+function renderTrips() {
+  const main = document.getElementById("main");
+  const trip = state.trips.find((t) => t.id === state.openTrip) || null;
+  if (!trip) {
+    main.innerHTML = `
+      <div class="card">
+        <h2>Trips <span class="count">${state.trips.length}</span></h2>
+        ${state.trips.length ? `<ul class="triplist" id="tripList">${state.trips.map((t) => `
+          <li class="triprow">
+            <button class="pick" data-open="${t.id}" style="flex:1;background:none;border:0;padding:0;cursor:pointer;text-align:left;">
+              <span class="tname">${t.name ? escapeHtml(t.name) : "Untitled trip"}</span>
+              <span class="tcode"> &middot; ${prettyRange(t.date_from, t.date_to)}</span>
+            </button>
+            <span class="tlock">${(t.going || []).length} going</span>
+          </li>`).join("")}</ul>`
+        : `<p class="hint">No trips yet. On the <b>Calendar</b> tab, find a window that works and hit <b>Make this a trip</b>.</p>`}
+      </div>`;
+    const tl = document.getElementById("tripList");
+    if (tl) tl.addEventListener("click", (e) => { const o = e.target.closest("[data-open]"); if (o) { state.openTrip = o.dataset.open; renderTrips(); } });
     return;
   }
 
-  if (state.tab !== "schedule" || state.drag) return;   // not while booking or mid-drag
-  if (Date.now() - state.lastEditAt < 2500) return;      // don't stomp a fresh local edit
-  const meta = await tripMetaFetch(state.room);
-  if (meta.name !== state.tripName) { state.tripName = meta.name; updateBoardName(); }
-  state.lockFrom = meta.lock_from; state.lockTo = meta.lock_to;
-  const rows = await dbFetch();
-  if (!rows) return;
-  state.people = rows;
-  if (state.group) {
-    state.groupTrips = await tripsByGroup(state.group);   // other trips' locks may have changed
-    applyOverlay(await overlayFetch());
-  }
-  if (!state.people.find((p) => p.id === state.selectedId)) state.selectedId = state.people[0]?.id ?? null;
-  updateAll();
-}
+  const byId = Object.fromEntries(state.members.map((m) => [m.id, m]));
+  const goingChips = state.members.map((m) => {
+    const on = (trip.going || []).includes(m.id);
+    return `<li><button data-toggle="${m.id}" class="${on ? "on" : ""}">${on ? "&#10003; " : "+ "}${escapeHtml(m.name)}</button></li>`;
+  }).join("");
 
-/* ---- group hub (shared roster + the group's trips) ---- */
-function renderGroup() {
-  const code = (state.group || "").toUpperCase().split("")
-    .map((ch) => `<span class="flap-tile">${escapeHtml(ch)}</span>`).join("");
-  const name = state.groupName ? escapeHtml(state.groupName) : "Name this group";
-  document.getElementById("app").innerHTML = `
-    <div class="wrap">
-      <header class="board">
-        <div class="board-id">
-          <span class="plane">&#128101;</span>
-          <div>
-            <span class="eyebrow">Your group</span>
-            <div class="tripname-row">
-              <span class="tripname ${state.groupName ? "" : "placeholder"}" id="groupName">${name}</span>
-              <button class="editname" id="editGroupName" title="Rename group">&#9998;</button>
-            </div>
-            <div class="flap" title="Group code">${code}</div>
-          </div>
+  main.innerHTML = `
+    <div class="card">
+      <button class="btn small" id="backTrips">&#8592; All trips</button>
+      <h2 style="margin-top:12px;">${trip.name ? escapeHtml(trip.name) : "Untitled trip"}
+        <button class="editname" id="editTrip" title="Rename" style="margin-left:6px;">&#9998;</button></h2>
+      <p class="hint" style="margin-top:0;">${prettyRange(trip.date_from, trip.date_to)} &middot; these days are blocked on the calendar for whoever's going.</p>
+      <p class="subhead">Who's going</p>
+      <ul class="addlist" id="goingList">${goingChips}</ul>
+      <div style="margin-top:16px;"><button class="btn danger small" id="delTrip">Delete trip</button></div>
+    </div>
+    <div class="card">
+      <h2>Booking details <span class="count">encrypted</span></h2>
+      <div class="notice">Each person's passport-level details are <b>encrypted in the browser</b> with a passphrase you all agree on. The server only ever stores unreadable text — even the host can't read it without the passphrase.</div>
+      <p class="subhead">Add or update your details</p>
+      <div id="bkFormWrap">
+        <label class="field"><span>You are</span>
+          <select class="inp" id="bkWho">${(trip.going || []).map((id) => byId[id] ? `<option value="${id}">${escapeHtml(byId[id].name)}</option>` : "").join("")}</select></label>
+        <div class="fgrid">
+          <label class="field"><span>Full legal name</span><input class="inp" id="bkName" /></label>
+          <label class="field"><span>Date of birth</span><input class="inp" id="bkDob" placeholder="1990-05-20" /></label>
+          <label class="field"><span>Nationality</span><input class="inp" id="bkNat" /></label>
+          <label class="field"><span>Passport number</span><input class="inp" id="bkPass" /></label>
+          <label class="field"><span>Passport expiry</span><input class="inp" id="bkExp" placeholder="2030-01-01" /></label>
+          <label class="field"><span>Frequent flyer #</span><input class="inp" id="bkFF" /></label>
+          <label class="field"><span>Seat preference</span><input class="inp" id="bkSeat" placeholder="window / aisle" /></label>
+          <label class="field"><span>Notes</span><input class="inp" id="bkNotes" /></label>
         </div>
-        <div class="board-actions">
-          <button class="btn ghost" id="gCopyBtn">Invite link</button>
-        </div>
-      </header>
-
-      <div class="grid">
-        <div>
-          <div class="card" id="memberCard">
-            <h2>Members <span class="count" id="memberCount">0</span></h2>
-            <p class="hint" style="margin-top:0;margin-bottom:12px;">Everyone here can be added to any trip. Add a date to one trip and it blocks those days for the same people in your other trips.</p>
-            <div class="row">
-              <input class="inp" id="memberInput" placeholder="Add a friend's name" />
-              <button class="btn primary" id="memberAddBtn">Add</button>
-            </div>
-            <ul id="memberList"></ul>
-          </div>
-        </div>
-        <div>
-          <div class="card" id="tripsCard">
-            <h2>Trips <span class="count" id="tripCount">0</span></h2>
-            <button class="btn primary" id="newTripBtn" style="width:100%;justify-content:center;">New trip</button>
-            <ul class="triplist" id="tripList"></ul>
-          </div>
-          <p class="footnote">Send the <b>Invite link</b> so friends join the group once. Each trip still has its own link and its own booking details.</p>
-        </div>
+        <label class="field"><span>Shared trip passphrase</span><input class="inp" id="bkPhrase" type="password" placeholder="everyone uses the same one" /></label>
+        <button class="btn primary" id="bkSave">Encrypt &amp; save my details</button>
+        <span class="hint" id="bkSaveMsg"></span>
       </div>
+      <p class="subhead">Booker: unlock everyone</p>
+      <div class="row">
+        <input class="inp" id="bkUnlockPhrase" type="password" placeholder="the shared passphrase" />
+        <button class="btn" id="bkUnlock">Unlock</button>
+      </div>
+      <div id="bkTable"></div>
     </div>`;
 
-  document.getElementById("gCopyBtn").onclick = copyGroupInvite;
-  document.getElementById("editGroupName").onclick = renameGroup;
-  document.getElementById("memberAddBtn").onclick = addGroupMember;
-  document.getElementById("memberInput").addEventListener("keydown", (e) => { if (e.key === "Enter") addGroupMember(); });
-  document.getElementById("newTripBtn").onclick = newGroupTrip;
-  document.getElementById("memberList").addEventListener("click", (e) => {
-    const del = e.target.closest("[data-delmember]");
-    if (del) removeGroupMember(del.dataset.delmember);
+  document.getElementById("backTrips").onclick = () => { state.openTrip = null; renderTrips(); };
+  document.getElementById("editTrip").onclick = async () => {
+    const next = window.prompt("Rename trip", trip.name || ""); if (next === null) return;
+    trip.name = next.trim().slice(0, 60); applyTripOverlay(); await tripUpdate(trip.id, { name: trip.name }); renderTrips();
+  };
+  document.getElementById("delTrip").onclick = async () => {
+    if (!window.confirm("Delete this trip? Its dates will be freed up on the calendar. Booking details for it are also deleted.")) return;
+    state.trips = state.trips.filter((t) => t.id !== trip.id); state.openTrip = null; applyTripOverlay();
+    await tripDelete(trip.id); render();
+  };
+  document.getElementById("goingList").addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-toggle]"); if (!b) return;
+    const id = b.dataset.toggle;
+    trip.going = (trip.going || []).includes(id) ? trip.going.filter((g) => g !== id) : [...(trip.going || []), id];
+    applyTripOverlay(); renderTrips(); await tripUpdate(trip.id, { going: trip.going });
   });
-  document.getElementById("tripList").addEventListener("click", (e) => {
-    const open = e.target.closest("[data-open]");
-    if (open) location.search = "?room=" + encodeURIComponent(open.dataset.open);
-  });
-  updateMembers();
-  updateTripsList();
+  document.getElementById("bkSave").onclick = () => bookingSave(trip);
+  document.getElementById("bkUnlock").onclick = () => bookingUnlock(trip);
 }
-function updateGroupName() {
-  const el = document.getElementById("groupName");
-  if (!el) return;
-  el.textContent = state.groupName ? state.groupName : "Name this group";
-  el.classList.toggle("placeholder", !state.groupName);
+
+async function bookingSave(trip) {
+  const msg = document.getElementById("bkSaveMsg");
+  if (!cryptoReady()) { msg.textContent = "Needs https or localhost to encrypt."; msg.className = "hint fail"; return; }
+  const memberId = document.getElementById("bkWho").value;
+  const member = state.members.find((m) => m.id === memberId);
+  const phrase = document.getElementById("bkPhrase").value;
+  if (!member || !phrase) { msg.textContent = "Pick who you are and enter the passphrase."; msg.className = "hint fail"; return; }
+  const obj = {
+    fullName: document.getElementById("bkName").value.trim(),
+    dob: document.getElementById("bkDob").value.trim(),
+    nationality: document.getElementById("bkNat").value.trim(),
+    passport: document.getElementById("bkPass").value.trim(),
+    passportExpiry: document.getElementById("bkExp").value.trim(),
+    frequentFlyer: document.getElementById("bkFF").value.trim(),
+    seat: document.getElementById("bkSeat").value.trim(),
+    notes: document.getElementById("bkNotes").value.trim(),
+  };
+  const blob = await encryptJSON(obj, phrase);
+  await bkUpsert(trip.id, memberId, member.name, blob);
+  msg.textContent = "Saved (encrypted)."; msg.className = "hint ok";
+  ["bkName","bkDob","bkNat","bkPass","bkExp","bkFF","bkSeat","bkNotes","bkPhrase"].forEach((id) => (document.getElementById(id).value = ""));
 }
-async function renameGroup() {
-  const next = window.prompt("Name this group", state.groupName || "");
-  if (next === null) return;
-  state.groupName = next.trim().slice(0, 60);
-  updateGroupName();
-  await groupSetName(state.groupName);
-}
-function updateMembers() {
-  const el = document.getElementById("memberList");
-  if (!el) return;
-  document.getElementById("memberCount").textContent = state.members.length;
-  el.innerHTML = state.members.length
-    ? state.members.map((m) => `
-        <li class="person">
-          <span class="name" style="flex:1;">${escapeHtml(m.name)}</span>
-          <button class="del" data-delmember="${m.id}" title="Remove from group">&times;</button>
-        </li>`).join("")
-    : `<li class="empty">No members yet. Add your friends above.</li>`;
-}
-function updateTripsList() {
-  const el = document.getElementById("tripList");
-  if (!el) return;
-  document.getElementById("tripCount").textContent = state.groupTrips.length;
-  el.innerHTML = state.groupTrips.length
-    ? state.groupTrips.map((t) => `
-        <li class="triprow">
-          <button class="pick" data-open="${t.room}" style="flex:1;background:none;border:0;padding:0;cursor:pointer;text-align:left;">
-            <span class="tname">${t.name ? escapeHtml(t.name) : "Untitled trip"}</span>
-            <span class="tcode"> &middot; ${escapeHtml(t.room.toUpperCase())}</span>
-          </button>
-          ${t.lock_from ? `<span class="tlock">&#128274; ${prettyRange(t.lock_from, t.lock_to)}</span>` : ""}
-        </li>`).join("")
-    : `<li class="empty">No trips yet. Start one with New trip.</li>`;
-}
-async function addGroupMember() {
-  const input = document.getElementById("memberInput");
-  const nm = input.value.trim();
-  if (!nm) return;
-  input.value = "";
-  const m = await memberAdd(state.group, nm);
-  if (!m) return;
-  state.members = [...state.members, m].sort((a, b) => a.name.localeCompare(b.name));
-  updateMembers();
-}
-async function removeGroupMember(id) {
-  state.members = state.members.filter((m) => m.id !== id);
-  updateMembers();
-  await memberDelete(id);
-}
-async function newGroupTrip() {
-  const nm = (window.prompt("Name this trip (optional)", "") || "").trim().slice(0, 60);
-  const room = Math.random().toString(36).slice(2, 9);
-  await tripCreateInGroup(room, state.group, nm);
-  // put the whole roster on the new trip by default
-  for (const m of state.members) {
-    await sb.from("people").insert({ room, member_id: m.id, name: m.name, days: [], prefers: [], busy: [], busy_reasons: {} });
+async function bookingUnlock(trip) {
+  const out = document.getElementById("bkTable");
+  const phrase = document.getElementById("bkUnlockPhrase").value;
+  if (!phrase) { out.innerHTML = `<p class="hint fail">Enter the shared passphrase.</p>`; return; }
+  const rows = await bkFetch(trip.id) || [];
+  if (!rows.length) { out.innerHTML = `<p class="hint">Nobody's added details yet.</p>`; return; }
+  const okRows = [], failRows = [];
+  for (const r of rows) { try { okRows.push({ name: r.name, id: r.id, d: await decryptJSON(r.blob, phrase) }); } catch { failRows.push(r.name); } }
+  const cols = [["fullName","Name"],["dob","DOB"],["nationality","Nationality"],["passport","Passport"],["passportExpiry","Expiry"],["frequentFlyer","FF#"],["seat","Seat"],["notes","Notes"]];
+  let html = "";
+  if (okRows.length) {
+    html += `<table class="rev"><thead><tr><th>Person</th>${cols.map((c) => `<th>${c[1]}</th>`).join("")}<th></th></tr></thead><tbody>`;
+    html += okRows.map((r) => `<tr><td>${escapeHtml(r.name)}</td>${cols.map((c) => `<td>${escapeHtml(r.d[c[0]] || "")}</td>`).join("")}<td><button class="btn small" data-copy='${escapeHtml(JSON.stringify({ name: r.name, ...r.d }))}'>Copy</button></td></tr>`).join("");
+    html += `</tbody></table><div style="margin-top:10px;"><button class="btn small" id="bkCopyAll">Copy all</button> <button class="btn danger small" id="bkDelAll">Delete all details</button></div>`;
   }
-  location.search = "?room=" + room;
+  if (failRows.length) html += `<p class="hint fail" style="margin-top:8px;">Couldn't unlock (different passphrase): ${failRows.map(escapeHtml).join(", ")}</p>`;
+  out.innerHTML = html;
+  const allText = okRows.map((r) => `${r.name}: ` + cols.map((c) => `${c[1]}=${r.d[c[0]] || ""}`).join(", ")).join("\n");
+  const ca = document.getElementById("bkCopyAll"); if (ca) ca.onclick = () => navigator.clipboard.writeText(allText);
+  out.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => navigator.clipboard.writeText(b.dataset.copy)));
+  const da = document.getElementById("bkDelAll"); if (da) da.onclick = async () => { if (window.confirm("Delete everyone's booking details for this trip?")) { await bkDeleteAll(trip.id); bookingUnlock(trip); } };
 }
+
+/* ================= landing ================= */
 function renderLanding() {
   document.getElementById("app").innerHTML = `
     <div class="landing">
       <div class="pass">
-        <div class="pass-top">
-          <span class="plane">&#9992;</span>
-          <span class="eyebrow">Trip Planner &middot; Boarding</span>
-        </div>
+        <div class="pass-top"><span class="plane">&#9992;</span><span class="eyebrow">Trip Planner &middot; Boarding</span></div>
         <div class="pass-body">
-          <h1>Plan a trip together</h1>
-          <p>Everyone marks when they can travel. You see the stretches that fit — then one person books.</p>
+          <h1>Plan trips together</h1>
+          <p>One shared calendar. Everyone marks when they can travel — once. Agreed dates become trips that keep your future plans from clashing.</p>
           ${configured ? `
-            <button class="btn primary" id="createBtn" style="width:100%;justify-content:center;">Start a new trip</button>
-            <button class="btn" id="createGroupBtn" style="width:100%;justify-content:center;margin-top:8px;">Start a group of trips</button>
+            <button class="btn primary" id="createBtn" style="width:100%;justify-content:center;">Start a shared calendar</button>
             <p class="or">or join one</p>
-            <div class="row">
-              <input class="inp" id="joinCode" placeholder="Enter a trip or group code" />
-              <button class="btn" id="joinBtn">Join</button>
-            </div>
-            <p class="hint" style="margin-top:10px;">A <b>group</b> keeps one list of friends across many trips, and blocks dates you've locked in one trip from clashing with the others.</p>
+            <div class="row"><input class="inp" id="joinCode" placeholder="Enter a calendar code" /><button class="btn" id="joinBtn">Join</button></div>
           ` : `
-            <div class="setup">
-              Almost there — open <code>index.html</code> and paste your Supabase
-              <code>Project URL</code> and <code>publishable key</code> into the CONFIG
-              section at the top. The README walks through it.
-            </div>
-          `}
+            <div class="setup">Almost there — open <code>index.html</code> and paste your Supabase <code>Project URL</code> and <code>publishable key</code> into the CONFIG block at the top. The README walks through it.</div>`}
         </div>
       </div>
     </div>`;
   if (!configured) return;
-  document.getElementById("createBtn").onclick = () => {
+  document.getElementById("createBtn").onclick = async () => {
     const code = Math.random().toString(36).slice(2, 9);
-    location.search = "?room=" + code;
-  };
-  document.getElementById("createGroupBtn").onclick = async () => {
-    const code = Math.random().toString(36).slice(2, 9);
-    await groupCreate(code, "");
-    location.search = "?group=" + code;
+    await calCreate(code, "");
+    location.search = "?cal=" + code;
   };
   document.getElementById("joinBtn").onclick = joinFromInput;
   document.getElementById("joinCode").addEventListener("keydown", (e) => { if (e.key === "Enter") joinFromInput(); });
 }
-async function joinFromInput() {
+function joinFromInput() {
   const code = document.getElementById("joinCode").value.trim();
-  if (!code) return;
-  const g = await groupFetch(code);            // a group code takes you to the hub
-  location.search = (g ? "?group=" : "?room=") + encodeURIComponent(code);
+  if (code) location.search = "?cal=" + encodeURIComponent(code);
 }
 
-/* ---- boot ---- */
+/* ================= boot + live sync ================= */
+async function loadAll() {
+  const people = await peopleFetch();
+  const trips = await tripsFetch();
+  if (people) state.members = people;
+  if (trips) state.trips = trips;
+  applyTripOverlay();
+  if (!state.members.find((m) => m.id === state.selectedId)) state.selectedId = state.members[0]?.id ?? null;
+}
 async function boot() {
-  const params = new URLSearchParams(location.search);
-  const room = params.get("room"), group = params.get("group");
-  if (!configured) { renderLanding(); return; }
-
-  if (room) {
-    state.mode = "trip";
-    state.room = room;
-    const meta = await tripMetaFetch(room);
-    state.tripName = meta.name;
-    state.group = meta.group_code;
-    state.lockFrom = meta.lock_from; state.lockTo = meta.lock_to;
-    if (state.group) {
-      const g = await groupFetch(state.group);
-      state.groupName = g ? g.name : "";
-      state.members = await membersFetch(state.group);
-      state.groupTrips = await tripsByGroup(state.group);
-    }
-    render();
-    const rows = await dbFetch();
-    if (rows) {
-      state.people = rows;
-      if (state.group) applyOverlay(await overlayFetch());
-      state.selectedId = state.people[0]?.id ?? null;
-      if (state.tab === "schedule") updateAll();
-    }
-  } else if (group) {
-    const g = await groupFetch(group);
-    if (!g) { renderLanding(); return; }
-    state.mode = "group";
-    state.group = group; state.groupName = g.name;
-    state.members = await membersFetch(group);
-    state.groupTrips = await tripsByGroup(group);
-    renderGroup();
-  } else {
-    renderLanding();
-    return;
-  }
+  const cal = new URLSearchParams(location.search).get("cal");
+  if (!configured || !cal) { state.mode = "landing"; renderLanding(); return; }
+  const c = await calFetch(cal);
+  if (!c) { state.mode = "landing"; renderLanding(); return; }
+  state.mode = "cal"; state.cal = cal; state.calName = c.name;
+  await loadAll();
+  render();
   setInterval(poll, 5000);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") poll(); });
+}
+async function poll() {
+  if (!sb || document.visibilityState !== "visible" || state.mode !== "cal") return;
+  if (state.drag) return;
+  if (Date.now() - state.lastEditAt < 2500) return;
+  const c = await calFetch(state.cal);
+  if (c && c.name !== state.calName) { state.calName = c.name; updateCalNameEl(); }
+  await loadAll();
+  // refresh only the light, non-focus-stealing bits of whichever tab is open
+  if (state.tab === "calendar") { if (document.getElementById("calGrid")) { updateRoster(); updateCalendar(); updateResults(); } }
 }
 boot();
 </script>
