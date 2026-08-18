@@ -755,6 +755,30 @@ function render() {
 }
 
 /* ================= Calendar tab ================= */
+// runs of consecutive non-working days (weekend or PH holiday) that are 3+ days long
+function longWeekends(from, months) {
+  const start = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+  const end = new Date(start.getFullYear(), start.getMonth() + months, start.getDate());
+  const isOff = (d) => { const wd = d.getDay(); return wd === 0 || wd === 6 || !!holidayName(fmt(d)); };
+  const runs = []; let d = new Date(start);
+  while (d <= end) {
+    if (isOff(d)) {
+      const runStart = new Date(d); const names = [];
+      while (d <= end && isOff(d)) { const h = holidayName(fmt(d)); if (h) names.push(h); d = addDays(d, 1); }
+      const runEnd = addDays(d, -1);
+      const len = Math.round((runEnd - runStart) / 86400000) + 1;
+      if (len >= 3 && names.length) runs.push({ from: fmt(runStart), to: fmt(runEnd), len, label: names.join(" / ") });
+    } else d = addDays(d, 1);
+  }
+  return runs;
+}
+function fillLongWeekends() {
+  const sel = document.getElementById("lwJump"); if (!sel) return;
+  const runs = longWeekends(new Date(), 14);
+  sel.innerHTML = `<option value="">&#127958; Jump to a long weekend&hellip;</option>` +
+    runs.map((r) => `<option value="${r.from}">${prettyRange(r.from, r.to)} · ${r.len} days · ${escapeHtml(r.label)}</option>`).join("");
+}
+
 function renderCalendar() {
   document.getElementById("main").innerHTML = `
     <div class="grid">
@@ -776,6 +800,7 @@ function renderCalendar() {
             <span id="monthLabel"></span>
             <button class="nav" id="nextM">&#8250;</button>
           </div>
+          <select class="inp" id="lwJump" style="margin-bottom:12px;"></select>
           <p id="calHint"></p>
           <div class="markbar">
             <span class="lab">I'm marking:</span>
@@ -787,7 +812,9 @@ function renderCalendar() {
               <span class="lab">Reason:</span>
               <div class="seg reason" id="reasonSeg">
                 <button data-reason="work">Work</button>
+                <button data-reason="school">School</button>
                 <button data-reason="family">Family</button>
+                <button data-reason="travel">Travel</button>
                 <button data-reason="other">Other</button>
               </div>
             </span>
@@ -800,6 +827,7 @@ function renderCalendar() {
           </div>
           <div class="weekdays"><div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div></div>
           <div class="cal-grid" id="calGrid"></div>
+          <p id="holiList" class="hint" style="margin-top:12px;"></p>
           <div class="legend">
             <span><span class="sw" style="background:#22c55e"></span>everyone free</span>
             <span><span class="sw" style="background:#86efac"></span>most free</span>
@@ -831,7 +859,15 @@ function renderCalendar() {
     </div>`;
 
   updateRoster(); updateCalendar(); updateResults();
+  fillLongWeekends();
 
+  document.getElementById("lwJump").onchange = (e) => {
+    if (!e.target.value) return;
+    const d = parse(e.target.value);
+    state.view = new Date(d.getFullYear(), d.getMonth(), 1);
+    updateCalendar();
+    e.target.value = "";
+  };
   document.getElementById("addBtn").onclick = addMember;
   document.getElementById("nameInput").addEventListener("keydown", (e) => { if (e.key === "Enter") addMember(); });
   document.getElementById("prevM").onclick = () => { state.view = new Date(state.view.getFullYear(), state.view.getMonth() - 1, 1); updateCalendar(); };
@@ -931,6 +967,15 @@ function updateCalendar() {
     html += `<button class="day ${dayClass(f, b, total)} ${iFree ? "mine" : ""} ${(iBusy || iLocked) ? "mine-busy" : ""} ${iLocked ? "locked" : ""} ${holi ? "holi" : ""} ${ds === today ? "today" : ""} ${selected ? "" : "disabled"}" data-day="${ds}" ${title ? `title="${escapeHtml(title)}"` : ""} ${selected ? "" : "disabled"}>${cellInner(d, f, b, myPref, iLocked || "", myReason || "")}</button>`;
   }
   document.getElementById("calGrid").innerHTML = html;
+  const hl = document.getElementById("holiList");
+  if (hl) {
+    const items = [];
+    for (let d = 1; d <= dim; d++) {
+      const dt = new Date(y, m, d), h = holidayName(fmt(dt));
+      if (h) items.push(`${dt.toLocaleDateString("en-US", { month: "short", day: "numeric" })} ${h}`);
+    }
+    hl.innerHTML = items.length ? `<b>&#127477;&#127469; holidays this month:</b> ${items.map(escapeHtml).join(" &middot; ")}` : "";
+  }
 }
 
 function updateResults() {
