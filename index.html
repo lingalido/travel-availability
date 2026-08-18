@@ -213,6 +213,41 @@
   .setup { background: #fff8ea; border: 1px solid #f6dd9e; color: #7a5a12;
     border-radius: 12px; padding: 15px; font-size: 14px; line-height: 1.5; }
   .setup code { background: #fbeecb; padding: 1px 6px; border-radius: 5px; font-family: var(--mono); font-size: 13px; }
+
+  /* trip name on the board */
+  .tripname-row { display: flex; align-items: center; gap: 8px; margin: 3px 0 8px; }
+  .tripname { font-family: var(--display); font-weight: 700; font-size: 19px; color: #fff; letter-spacing: -.01em; }
+  .tripname.placeholder { color: #6f86a0; font-weight: 500; font-style: italic; cursor: pointer; }
+  .editname { background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.16); color: #cdd9e6;
+    width: 26px; height: 26px; border-radius: 7px; cursor: pointer; font-size: 12px; line-height: 1; padding: 0; }
+  .editname:hover { background: rgba(255,255,255,.16); color: #fff; }
+
+  /* busy reason chips */
+  .reasonwrap { display: inline-flex; align-items: center; gap: 8px; }
+  .seg.reason button.on { background: var(--amber); color: #10233b; }
+
+  /* group: shared roster + trips */
+  .subhead { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: #9aabbd;
+    margin: 16px 0 8px; font-family: var(--mono); }
+  .addlist { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 7px; }
+  .addlist button { border: 1px dashed #c4d2e0; background: #fff; color: var(--muted);
+    border-radius: 999px; padding: 5px 12px; font-size: 13px; cursor: pointer; font-family: var(--body); transition: .12s; }
+  .addlist button:hover { border-color: var(--amber-deep); color: var(--ink); background: #fff8ea; }
+  .triplist { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .triprow { display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 11px; padding: 11px 13px; transition: .12s; }
+  .triprow:hover { border-color: var(--amber-deep); background: #fff8ea; }
+  .triprow .tname { font-family: var(--display); font-weight: 600; font-size: 14px; color: var(--ink); }
+  .triprow .tcode { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .triprow .tlock { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--free); white-space: nowrap; }
+
+  /* lock banner + locked calendar days */
+  .lockbar { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; border-radius: 12px;
+    padding: 10px 14px; margin-bottom: 12px; font-size: 13px; }
+  .lockbar .rng { font-family: var(--mono); font-weight: 700; }
+  .lockbtn { margin-top: 8px; }
+  .day.locked { cursor: default; }
+  .day .lock { position: absolute; bottom: 3px; right: 4px; font-size: 8px; opacity: .8; }
 </style>
 </head>
 <body>
@@ -239,6 +274,14 @@ const sb = configured ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON
 /* ---- state ---- */
 const state = {
   room: null,
+  tripName: "",
+  group: null,       // group code, if this trip/hub belongs to a group
+  groupName: "",
+  members: [],       // shared roster [{id,name}]
+  groupTrips: [],    // sibling trips [{room,name,lock_from,lock_to}]
+  lockFrom: null,    // this trip's locked range (the agreed dates)
+  lockTo: null,
+  mode: "trip",      // "trip" | "group" | "landing"
   people: [],
   selectedId: null,
   view: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
@@ -247,6 +290,7 @@ const state = {
   lastEditAt: 0,
   tab: "schedule",   // "schedule" | "booking"
   markMode: "free",  // which state a tap/drag paints: "free" | "busy"
+  busyReason: null,  // optional label applied to newly-marked busy days
   availMode: "notbusy", // count someone available when: "notbusy" | "free"
   drag: null,        // active drag-to-fill on the calendar
   bookings: [],      // encrypted booking entries for this room
@@ -277,9 +321,11 @@ function computeWindows() {
   const free = {}, pref = {}, busy = {};
   const marks = new Set();
   for (const p of people) {
-    for (const d of p.days) { free[d] = (free[d] || 0) + 1; marks.add(d); }
-    for (const d of (p.prefers || [])) pref[d] = (pref[d] || 0) + 1;
+    const lset = new Set(Object.keys(p.locked || {}));
+    for (const d of p.days) if (!lset.has(d)) { free[d] = (free[d] || 0) + 1; marks.add(d); }
+    for (const d of (p.prefers || [])) if (!lset.has(d)) pref[d] = (pref[d] || 0) + 1;
     for (const d of (p.busy || [])) { busy[d] = (busy[d] || 0) + 1; marks.add(d); }
+    for (const d of lset) { busy[d] = (busy[d] || 0) + 1; marks.add(d); }
   }
   const marked = [...marks].sort();
   if (!marked.length) return { windows: [], noConflict: 0, hasMarks: false };
@@ -299,17 +345,27 @@ function computeWindows() {
       while (j < all.length && total - avail(all[j]) <= state.maxDrop) j++;
       const run = all.slice(i, j);
       if (run.length >= state.minLen) {
-        const busyNames = new Set(), unconfirmed = new Set();
+        const busyMap = new Map(), unconfirmed = new Set();
         let prefSum = 0, freeSum = 0;
         for (const rd of run) {
           prefSum += pref[rd] || 0; freeSum += free[rd] || 0;
           for (const p of people) {
-            if ((p.busy || []).includes(rd)) busyNames.add(p.name);
-            else if (!p.days.includes(rd)) unconfirmed.add(p.name);
+            const lk = p.locked && p.locked[rd];
+            if (lk) {
+              if (!busyMap.has(p.name)) busyMap.set(p.name, new Set());
+              busyMap.get(p.name).add(lk);
+            } else if ((p.busy || []).includes(rd)) {
+              if (!busyMap.has(p.name)) busyMap.set(p.name, new Set());
+              const r = (p.busyReasons || {})[rd];
+              if (r) busyMap.get(p.name).add(r);
+            } else if (!p.days.includes(rd)) unconfirmed.add(p.name);
           }
         }
+        const busy = [...busyMap.entries()]
+          .map(([name, rs]) => ({ name, reasons: [...rs] }))
+          .sort((a, b) => a.name.localeCompare(b.name));
         windows.push({ from: run[0], to: run[run.length - 1], len: run.length,
-          busy: [...busyNames], unconfirmed: [...unconfirmed],
+          busy, unconfirmed: [...unconfirmed],
           prefScore: prefSum / run.length, freeScore: freeSum / run.length,
           preferred: prefSum / run.length >= 1 });
       }
@@ -327,28 +383,124 @@ function computeWindows() {
 
 /* ---- database ---- */
 async function dbFetch() {
-  const { data, error } = await sb.from("people").select("id,name,days,prefers,busy").eq("room", state.room);
+  const { data, error } = await sb.from("people").select("id,name,days,prefers,busy,busy_reasons,member_id").eq("room", state.room);
   if (error) { console.error(error); return null; }
-  return data.map((r) => ({ id: r.id, name: r.name,
+  return data.map((r) => ({ id: r.id, name: r.name, member_id: r.member_id || null,
                             days: Array.isArray(r.days) ? r.days : [],
                             prefers: Array.isArray(r.prefers) ? r.prefers : [],
-                            busy: Array.isArray(r.busy) ? r.busy : [] }))
+                            busy: Array.isArray(r.busy) ? r.busy : [],
+                            busyReasons: (r.busy_reasons && typeof r.busy_reasons === "object") ? r.busy_reasons : {},
+                            locked: {} }))
              .sort((a, b) => a.name.localeCompare(b.name));
 }
-async function dbAdd(name) {
-  const { data, error } = await sb.from("people").insert({ room: state.room, name, days: [], prefers: [], busy: [] })
-                                  .select("id,name,days,prefers,busy").single();
+async function dbAdd(name, memberId) {
+  const row = { room: state.room, name, days: [], prefers: [], busy: [], busy_reasons: {} };
+  if (memberId) row.member_id = memberId;
+  const { data, error } = await sb.from("people").insert(row)
+    .select("id,name,days,prefers,busy,busy_reasons,member_id").single();
   if (error) { console.error(error); return null; }
-  return { id: data.id, name: data.name, days: [], prefers: [], busy: [] };
+  return { id: data.id, name: data.name, member_id: data.member_id || null,
+           days: [], prefers: [], busy: [], busyReasons: {}, locked: {} };
 }
-async function dbUpdate(id, days, prefers, busy) {
+async function dbUpdate(id, days, prefers, busy, busyReasons) {
   const { error } = await sb.from("people")
-    .update({ days, prefers, busy, updated_at: new Date().toISOString() }).eq("id", id);
+    .update({ days, prefers, busy, busy_reasons: busyReasons || {}, updated_at: new Date().toISOString() })
+    .eq("id", id);
   if (error) console.error(error);
 }
+const savePerson = (p) => dbUpdate(p.id, p.days, p.prefers, p.busy, p.busyReasons);
 async function dbDelete(id) {
   const { error } = await sb.from("people").delete().eq("id", id);
   if (error) console.error(error);
+}
+
+/* ---- trip meta (name, group link, locked dates) ---- */
+async function tripMetaFetch(room) {
+  const { data, error } = await sb.from("trips").select("name,group_code,lock_from,lock_to").eq("room", room).limit(1);
+  if (error) { console.error(error); return { name: "", group_code: null, lock_from: null, lock_to: null }; }
+  const r = (data && data.length) ? data[0] : {};
+  return { name: r.name || "", group_code: r.group_code || null, lock_from: r.lock_from || null, lock_to: r.lock_to || null };
+}
+async function tripSetName(name) {
+  const { data: ex } = await sb.from("trips").select("room").eq("room", state.room).limit(1);
+  if (ex && ex.length) {
+    const { error } = await sb.from("trips").update({ name, updated_at: new Date().toISOString() }).eq("room", state.room);
+    if (error) console.error(error);
+  } else {
+    const { error } = await sb.from("trips").insert({ room: state.room, name });
+    if (error) console.error(error);
+  }
+}
+async function tripSetLock(room, from, to) {
+  const { error } = await sb.from("trips").update({ lock_from: from, lock_to: to, updated_at: new Date().toISOString() }).eq("room", room);
+  if (error) console.error(error);
+}
+
+/* ---- groups + shared roster ---- */
+async function groupFetch(code) {
+  const { data, error } = await sb.from("groups").select("code,name").eq("code", code).limit(1);
+  if (error) { console.error(error); return null; }
+  return (data && data.length) ? { code: data[0].code, name: data[0].name || "" } : null;
+}
+async function groupCreate(code, name) {
+  const { error } = await sb.from("groups").insert({ code, name: name || "" });
+  if (error) console.error(error);
+}
+async function groupSetName(name) {
+  const { error } = await sb.from("groups").update({ name }).eq("code", state.group);
+  if (error) console.error(error);
+}
+async function membersFetch(group) {
+  const { data, error } = await sb.from("members").select("id,name").eq("group_code", group);
+  if (error) { console.error(error); return []; }
+  return data.map((r) => ({ id: r.id, name: r.name })).sort((a, b) => a.name.localeCompare(b.name));
+}
+async function memberAdd(group, name) {
+  const { data, error } = await sb.from("members").insert({ group_code: group, name }).select("id,name").single();
+  if (error) { console.error(error); return null; }
+  return { id: data.id, name: data.name };
+}
+async function memberDelete(id) {
+  await sb.from("people").delete().eq("member_id", id);   // drop their availability from every trip
+  const { error } = await sb.from("members").delete().eq("id", id);
+  if (error) console.error(error);
+}
+async function tripsByGroup(group) {
+  const { data, error } = await sb.from("trips").select("room,name,lock_from,lock_to").eq("group_code", group);
+  if (error) { console.error(error); return []; }
+  return data.map((r) => ({ room: r.room, name: r.name || "", lock_from: r.lock_from || null, lock_to: r.lock_to || null }));
+}
+async function tripCreateInGroup(room, group, name) {
+  const { error } = await sb.from("trips").insert({ room, group_code: group, name: name || "" });
+  if (error) console.error(error);
+}
+
+/* ---- cross-trip lock overlay: locked dates from the group's OTHER trips ---- */
+async function overlayFetch() {
+  const locked = {};                       // member_id -> { "YYYY-MM-DD": tripName }
+  if (!state.group) return locked;
+  const siblings = state.groupTrips.filter((t) => t.room !== state.room && t.lock_from && t.lock_to);
+  if (!siblings.length) return locked;
+  const rooms = siblings.map((t) => t.room);
+  const { data, error } = await sb.from("people").select("room,member_id").in("room", rooms);
+  if (error) { console.error(error); return locked; }
+  const goingByRoom = {};
+  for (const r of data) { if (!r.member_id) continue; (goingByRoom[r.room] ||= []).push(r.member_id); }
+  for (const t of siblings) {
+    const label = t.name || "another trip";
+    let d = parse(t.lock_from); const end = parse(t.lock_to);
+    while (d <= end) {
+      const ds = fmt(d);
+      for (const mid of (goingByRoom[t.room] || [])) { (locked[mid] ||= {})[ds] = label; }
+      d = addDays(d, 1);
+    }
+  }
+  return locked;
+}
+function applyOverlay(lockedByMember) {
+  for (const p of state.people) {
+    p.locked = (p.member_id && lockedByMember[p.member_id]) ? lockedByMember[p.member_id] : {};
+  }
 }
 
 /* ---- encryption (runs in the browser; the server only ever sees ciphertext) ---- */
@@ -399,7 +551,25 @@ async function addPerson() {
   const name = input.value.trim();
   if (!name) return;
   input.value = "";
-  const row = await dbAdd(name);
+  let row;
+  if (state.group) {
+    const m = await memberAdd(state.group, name);       // add to the shared roster
+    if (!m) return;
+    state.members = [...state.members, m].sort((a, b) => a.name.localeCompare(b.name));
+    row = await dbAdd(name, m.id);                        // and onto this trip
+  } else {
+    row = await dbAdd(name);
+  }
+  if (!row) return;
+  state.people = [...state.people, row].sort((a, b) => a.name.localeCompare(b.name));
+  state.selectedId = row.id;
+  updateAll();
+}
+async function addMemberToTrip(memberId) {
+  if (state.people.some((p) => p.member_id === memberId)) return;
+  const m = state.members.find((x) => x.id === memberId);
+  if (!m) return;
+  const row = await dbAdd(m.name, m.id);
   if (!row) return;
   state.people = [...state.people, row].sort((a, b) => a.name.localeCompare(b.name));
   state.selectedId = row.id;
@@ -413,33 +583,35 @@ async function removePerson(id) {
 }
 async function toggleDay(ds) {
   const p = currentPerson(); if (!p) return;
-  const prefers = p.prefers || [], busy = p.busy || [];
-  let days = p.days, prefs = prefers, bus = busy;
+  if (p.locked && p.locked[ds]) return;   // committed to another trip — read-only here
+  const prefers = p.prefers || [], busy = p.busy || [], reasons = p.busyReasons || {};
+  let days = p.days, prefs = prefers, bus = busy, rs = { ...reasons };
   if (state.markMode === "busy") {
     if (busy.includes(ds)) {                 // busy -> clear
-      bus = busy.filter((d) => d !== ds);
+      bus = busy.filter((d) => d !== ds); delete rs[ds];
     } else {                                  // anything -> busy (clears free/pref)
       bus = [...busy, ds];
+      if (state.busyReason) rs[ds] = state.busyReason;
       days = p.days.filter((d) => d !== ds);
       prefs = prefers.filter((d) => d !== ds);
     }
   } else {
     if (busy.includes(ds)) {                  // busy -> free
-      bus = busy.filter((d) => d !== ds);
+      bus = busy.filter((d) => d !== ds); delete rs[ds];
       days = [...p.days, ds];
-    } else if (!p.days.includes(ds)) {        // clear -> free
+    } else if (!p.days.includes(ds)) {         // clear -> free
       days = [...p.days, ds];
-    } else if (!prefers.includes(ds)) {       // free -> preferred
+    } else if (!prefers.includes(ds)) {        // free -> preferred
       prefs = [...prefers, ds];
-    } else {                                   // preferred -> clear
+    } else {                                    // preferred -> clear
       days = p.days.filter((d) => d !== ds);
       prefs = prefers.filter((d) => d !== ds);
     }
   }
-  p.days = days; p.prefers = prefs; p.busy = bus;
+  p.days = days; p.prefers = prefs; p.busy = bus; p.busyReasons = rs;
   state.lastEditAt = Date.now();
   updateRoster(); updateCalendar(); updateResults();
-  await dbUpdate(p.id, p.days, p.prefers, p.busy);
+  await savePerson(p);
 }
 
 const currentPerson = () => state.people.find((p) => p.id === state.selectedId) || null;
@@ -447,17 +619,20 @@ const currentPerson = () => state.people.find((p) => p.id === state.selectedId) 
 /* ---- drag to fill a range (pointer = mouse + touch) ---- */
 function paintDay(ds, action) {
   const p = currentPerson(); if (!p) return;
+  if (p.locked && p.locked[ds]) return;   // locked by another trip
+  if (!p.busyReasons) p.busyReasons = {};
   const rm = (arr) => (arr || []).filter((d) => d !== ds);
   if (action === "setFree") {
-    p.busy = rm(p.busy);
+    p.busy = rm(p.busy); delete p.busyReasons[ds];
     if (!p.days.includes(ds)) p.days = [...p.days, ds];
   } else if (action === "clearFree") {
     p.days = rm(p.days); p.prefers = rm(p.prefers);
   } else if (action === "setBusy") {
     p.days = rm(p.days); p.prefers = rm(p.prefers);
     if (!(p.busy || []).includes(ds)) p.busy = [...(p.busy || []), ds];
+    if (state.busyReason) p.busyReasons[ds] = state.busyReason;
   } else if (action === "clearBusy") {
-    p.busy = rm(p.busy);
+    p.busy = rm(p.busy); delete p.busyReasons[ds];
   }
   updateDayCell(ds);
 }
@@ -498,7 +673,7 @@ async function onDragEnd() {
   const p = currentPerson();
   state.lastEditAt = Date.now();
   updateRoster(); updateResults();
-  if (p) await dbUpdate(p.id, p.days, p.prefers, p.busy); // one write for the whole drag
+  if (p) await savePerson(p); // one write for the whole drag
 }
 
 /* ---- weekend / clear shortcuts (act on the visible month, for the selected person) ---- */
@@ -507,14 +682,15 @@ async function markWeekends(pref) {
   const y = state.view.getFullYear(), m = state.view.getMonth();
   const dim = new Date(y, m + 1, 0).getDate();
   const days = new Set(p.days), prefs = new Set(p.prefers || []), busy = new Set(p.busy || []);
+  const reasons = { ...(p.busyReasons || {}) };
   for (let d = 1; d <= dim; d++) {
     const dt = new Date(y, m, d), wd = dt.getDay();
-    if (wd === 0 || wd === 6) { const ds = fmt(dt); days.add(ds); busy.delete(ds); if (pref) prefs.add(ds); }
+    if (wd === 0 || wd === 6) { const ds = fmt(dt); days.add(ds); busy.delete(ds); delete reasons[ds]; if (pref) prefs.add(ds); }
   }
-  p.days = [...days]; p.prefers = [...prefs]; p.busy = [...busy];
+  p.days = [...days]; p.prefers = [...prefs]; p.busy = [...busy]; p.busyReasons = reasons;
   state.lastEditAt = Date.now();
   updateRoster(); updateCalendar(); updateResults();
-  await dbUpdate(p.id, p.days, p.prefers, p.busy);
+  await savePerson(p);
 }
 async function clearMonth() {
   const p = currentPerson(); if (!p) return;
@@ -525,22 +701,42 @@ async function clearMonth() {
   p.days = p.days.filter((ds) => !inMonth.has(ds));
   p.prefers = (p.prefers || []).filter((ds) => !inMonth.has(ds));
   p.busy = (p.busy || []).filter((ds) => !inMonth.has(ds));
+  const reasons = { ...(p.busyReasons || {}) };
+  for (const ds of inMonth) delete reasons[ds];
+  p.busyReasons = reasons;
   state.lastEditAt = Date.now();
   updateRoster(); updateCalendar(); updateResults();
-  await dbUpdate(p.id, p.days, p.prefers, p.busy);
+  await savePerson(p);
 }
 
 /* ---- rendering ---- */
+function dayInfo(ds) {
+  let free = 0, busy = 0; const bnames = [];
+  for (const p of state.people) {
+    const lk = p.locked && p.locked[ds];
+    if (lk) { busy++; bnames.push(`${p.name} (${lk})`); continue; }
+    if ((p.busy || []).includes(ds)) {
+      busy++;
+      const r = (p.busyReasons || {})[ds];
+      bnames.push(r ? `${p.name} (${r})` : p.name);
+    } else if (p.days.includes(ds)) free++;
+  }
+  let title = "";
+  if (free) title += `${free} free`;
+  if (busy) title += (title ? " · " : "") + "busy: " + bnames.join(", ");
+  return { free, busy, title };
+}
 function dayClass(free, busy, total) {
   if (busy > 0) { const r = busy / total; return r >= 1 ? "b-all" : r >= 0.5 ? "b-some" : "b-few"; }
   if (free > 0) { const r = free / total; return r === 1 ? "h-all" : r >= 0.75 ? "h-most" : r >= 0.5 ? "h-half" : "h-few"; }
   return "h-none";
 }
-function cellInner(dnum, free, busy, myPref) {
+function cellInner(dnum, free, busy, myPref, locked) {
   return `${myPref ? `<span class="star">&#9733;</span>` : ""}` +
          `${busy ? `<span class="busytag">${busy}</span>` : ""}` +
          `<span class="n">${dnum}</span>` +
-         `${free ? `<span class="c">${free}</span>` : ""}`;
+         `${free ? `<span class="c">${free}</span>` : ""}` +
+         `${locked ? `<span class="lock" title="Booked: ${escapeHtml(locked)}">&#128274;</span>` : ""}`;
 }
 
 // repaint a single calendar cell (used during drag, avoids rebuilding the grid)
@@ -550,31 +746,21 @@ function updateDayCell(ds) {
   const cell = grid.querySelector(`[data-day="${ds}"]`);
   if (!cell) return;
   const total = state.people.length;
-  let free = 0, busy = 0;
-  for (const p of state.people) {
-    if (p.days.includes(ds)) free++;
-    if ((p.busy || []).includes(ds)) busy++;
-  }
+  const { free, busy, title } = dayInfo(ds);
   const p = currentPerson();
-  const iFree = p && p.days.includes(ds);
+  const iLocked = p && p.locked && p.locked[ds];
+  const iFree = p && p.days.includes(ds) && !iLocked;
   const iBusy = p && (p.busy || []).includes(ds);
   const myPref = p && (p.prefers || []).includes(ds);
-  cell.className = `day ${dayClass(free, busy, total)} ${iFree ? "mine" : ""} ${iBusy ? "mine-busy" : ""} ` +
-                  `${ds === fmt(new Date()) ? "today" : ""} ${p ? "" : "disabled"}`;
-  cell.innerHTML = cellInner(parse(ds).getDate(), free, busy, myPref);
+  cell.className = `day ${dayClass(free, busy, total)} ${iFree ? "mine" : ""} ${(iBusy || iLocked) ? "mine-busy" : ""} ` +
+                  `${iLocked ? "locked" : ""} ${ds === fmt(new Date()) ? "today" : ""} ${p ? "" : "disabled"}`;
+  cell.title = title;
+  cell.innerHTML = cellInner(parse(ds).getDate(), free, busy, myPref, iLocked || "");
 }
 
-function updateRoster() {
-  const total = state.people.length;
-  document.getElementById("peopleCount").textContent = total;
-  const ul = document.getElementById("roster");
-  if (!total) {
-    ul.innerHTML = `<li class="empty">Add everyone first, then tap a name to mark their free or busy days.</li>`;
-    return;
-  }
-  ul.innerHTML = state.people.map((p) => {
-    const b = (p.busy || []).length, pr = (p.prefers || []).length;
-    return `
+function personLi(p) {
+  const b = (p.busy || []).length, pr = (p.prefers || []).length;
+  return `
     <li class="person ${p.id === state.selectedId ? "active" : ""}">
       <button class="pick" data-select="${p.id}">
         <span class="name">${escapeHtml(p.name)}</span>
@@ -584,9 +770,44 @@ function updateRoster() {
           ${pr ? `<span class="p">&#9733;${pr}</span>` : ""}
         </span>
       </button>
-      <button class="del" data-remove="${p.id}" title="Remove">&times;</button>
+      <button class="del" data-remove="${p.id}" title="${state.group ? "Remove from this trip" : "Remove"}">&times;</button>
     </li>`;
-  }).join("");
+}
+function updateRoster() {
+  document.getElementById("peopleCount").textContent = state.people.length;
+  const body = document.getElementById("whoBody");
+  if (!body) return;
+
+  if (state.group) {
+    const onTrip = new Set(state.people.map((p) => p.member_id).filter(Boolean));
+    const notOn = state.members.filter((m) => !onTrip.has(m.id));
+    const going = state.people.length
+      ? `<ul id="roster">${state.people.map(personLi).join("")}</ul>`
+      : `<p class="hint">Nobody's on this trip yet — add people from your group below.</p>`;
+    const addFromGroup = notOn.length
+      ? `<p class="subhead">In the group</p>
+         <ul class="addlist">${notOn.map((m) =>
+            `<li><button data-addmember="${m.id}">+ ${escapeHtml(m.name)}</button></li>`).join("")}</ul>`
+      : "";
+    body.innerHTML = `
+      ${going}
+      ${addFromGroup}
+      <p class="subhead">New person</p>
+      <div class="row">
+        <input class="inp" id="nameInput" placeholder="Add someone to the group" />
+        <button class="btn primary" data-addbtn>Add</button>
+      </div>`;
+  } else {
+    const list = state.people.length
+      ? `<ul id="roster">${state.people.map(personLi).join("")}</ul>`
+      : `<ul id="roster"><li class="empty">Add everyone first, then tap a name to mark their free or busy days.</li></ul>`;
+    body.innerHTML = `
+      <div class="row">
+        <input class="inp" id="nameInput" placeholder="Add a friend's name" />
+        <button class="btn primary" data-addbtn>Add</button>
+      </div>
+      ${list}`;
+  }
 }
 
 function updateCalendar() {
@@ -607,12 +828,8 @@ function updateCalendar() {
   if (sc) sc.querySelectorAll("button").forEach((b) => (b.disabled = !selected));
   const mm = document.getElementById("markMode");
   if (mm) mm.querySelectorAll("button").forEach((b) => (b.disabled = !selected));
-
-  const free = {}, busy = {};
-  for (const p of state.people) {
-    for (const d of p.days) free[d] = (free[d] || 0) + 1;
-    for (const d of (p.busy || [])) busy[d] = (busy[d] || 0) + 1;
-  }
+  const rb = document.getElementById("reasonBar");
+  if (rb) rb.hidden = !(selected && state.markMode === "busy");
 
   const startWd = new Date(y, m, 1).getDay();
   const dim = new Date(y, m + 1, 0).getDate();
@@ -621,12 +838,13 @@ function updateCalendar() {
   for (let i = 0; i < startWd; i++) html += `<div></div>`;
   for (let d = 1; d <= dim; d++) {
     const ds = fmt(new Date(y, m, d));
-    const f = free[ds] || 0, b = busy[ds] || 0;
-    const iFree = selected && selected.days.includes(ds);
+    const { free: f, busy: b, title } = dayInfo(ds);
+    const iLocked = selected && selected.locked && selected.locked[ds];
+    const iFree = selected && selected.days.includes(ds) && !iLocked;
     const iBusy = selected && (selected.busy || []).includes(ds);
     const myPref = selected && (selected.prefers || []).includes(ds);
-    html += `<button class="day ${dayClass(f, b, total)} ${iFree ? "mine" : ""} ${iBusy ? "mine-busy" : ""} ${ds === today ? "today" : ""} ${selected ? "" : "disabled"}" data-day="${ds}" ${selected ? "" : "disabled"}>
-      ${cellInner(d, f, b, myPref)}
+    html += `<button class="day ${dayClass(f, b, total)} ${iFree ? "mine" : ""} ${(iBusy || iLocked) ? "mine-busy" : ""} ${iLocked ? "locked" : ""} ${ds === today ? "today" : ""} ${selected ? "" : "disabled"}" data-day="${ds}" ${title ? `title="${escapeHtml(title)}"` : ""} ${selected ? "" : "disabled"}>
+      ${cellInner(d, f, b, myPref, iLocked || "")}
     </button>`;
   }
   document.getElementById("calGrid").innerHTML = html;
@@ -645,20 +863,34 @@ function updateResults() {
     body = `<p class="hint">Nothing fits with these settings. Try a shorter minimum length, or allow more people to miss it.</p>`;
   } else {
     const strict = state.availMode === "free";
-    body = "<ul>" + windows.map((w) => {
+    const inGroup = !!state.group;
+    body = "";
+    if (inGroup && state.lockFrom) {
+      body += `<div class="lockbar">
+        <span>Locked in: <span class="rng">${prettyRange(state.lockFrom, state.lockTo)}</span> — blocked in your other trips</span>
+        <button class="btn small" data-unlock>Unlock</button>
+      </div>`;
+    }
+    body += "<ul>" + windows.map((w) => {
       const clear = w.busy.length === 0 && (!strict || w.unconfirmed.length === 0);
       let note;
       if (clear) note = "no conflicts";
       else {
         const parts = [];
-        if (w.busy.length) parts.push("busy: " + w.busy.map(escapeHtml).join(", "));
+        if (w.busy.length) {
+          const names = w.busy.map((b) =>
+            escapeHtml(b.name) + (b.reasons.length ? ` (${b.reasons.map(escapeHtml).join(", ")})` : ""));
+          parts.push("busy: " + names.join(", "));
+        }
         if (strict && w.unconfirmed.length) parts.push("not confirmed: " + w.unconfirmed.map(escapeHtml).join(", "));
         note = parts.join(" · ");
       }
+      const isLocked = inGroup && state.lockFrom === w.from && state.lockTo === w.to;
       return `<li class="win ${clear ? "clear" : ""}">
         <div>
           <div class="range">${prettyRange(w.from, w.to)}</div>
           <div class="meta">${w.len} day${w.len === 1 ? "" : "s"} in a row &middot; ${note}</div>
+          ${inGroup ? `<button class="btn small lockbtn" ${isLocked ? "disabled" : ""} data-lock="${w.from}|${w.to}">${isLocked ? "Locked" : "Lock these dates"}</button>` : ""}
         </div>
         <div class="tags">
           ${w.preferred ? `<span class="badge pref">&#9733; preferred</span>` : ""}
@@ -688,13 +920,9 @@ function renderPlanner() {
 
       <div class="grid">
         <div>
-          <div class="card">
+          <div class="card" id="whoCard">
             <h2>Who's going <span class="count" id="peopleCount">0</span></h2>
-            <div class="row">
-              <input class="inp" id="nameInput" placeholder="Add a friend's name" />
-              <button class="btn primary" id="addBtn">Add</button>
-            </div>
-            <ul id="roster"></ul>
+            <div id="whoBody"></div>
           </div>
 
           <div class="card">
@@ -734,6 +962,14 @@ function renderPlanner() {
                 <button data-mark="free" class="on">Free</button>
                 <button data-mark="busy">Busy</button>
               </div>
+              <span class="reasonwrap" id="reasonBar" hidden>
+                <span class="lab">Reason:</span>
+                <div class="seg reason" id="reasonSeg">
+                  <button data-reason="work">Work</button>
+                  <button data-reason="family">Family</button>
+                  <button data-reason="other">Other</button>
+                </div>
+              </span>
             </div>
             <div class="shortcuts" id="shortcuts">
               <button class="btn small" id="wkFree">Weekends free</button>
@@ -761,8 +997,6 @@ function renderPlanner() {
     </div>`;
 
   // static listeners
-  document.getElementById("addBtn").onclick = addPerson;
-  document.getElementById("nameInput").addEventListener("keydown", (e) => { if (e.key === "Enter") addPerson(); });
   document.getElementById("minLen").addEventListener("input", (e) => {
     state.minLen = Math.max(1, Number(e.target.value) || 1); updateResults();
   });
@@ -778,7 +1012,16 @@ function renderPlanner() {
     const b = e.target.closest("[data-mark]"); if (!b) return;
     state.markMode = b.dataset.mark;
     document.querySelectorAll("#markMode button").forEach((x) => x.classList.toggle("on", x === b));
+    const rb = document.getElementById("reasonBar");
+    if (rb) rb.hidden = !(state.selectedId && state.markMode === "busy");
     updateCalendar();
+  });
+  document.getElementById("reasonSeg").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-reason]"); if (!b) return;
+    const same = state.busyReason === b.dataset.reason;
+    state.busyReason = same ? null : b.dataset.reason;   // click again to clear
+    document.querySelectorAll("#reasonSeg button").forEach((x) =>
+      x.classList.toggle("on", !same && x === b));
   });
   document.getElementById("availSeg").addEventListener("click", (e) => {
     const b = e.target.closest("[data-avail]"); if (!b) return;
@@ -789,41 +1032,77 @@ function renderPlanner() {
   wireHeader();
 
   // delegated listeners
-  document.getElementById("roster").addEventListener("click", (e) => {
+  document.getElementById("whoCard").addEventListener("click", (e) => {
     const pick = e.target.closest("[data-select]");
     const del = e.target.closest("[data-remove]");
+    const addm = e.target.closest("[data-addmember]");
+    const addb = e.target.closest("[data-addbtn]");
     if (del) return removePerson(del.dataset.remove);
+    if (addm) return addMemberToTrip(addm.dataset.addmember);
+    if (addb) return addPerson();
     if (pick) { state.selectedId = pick.dataset.select; updateRoster(); updateCalendar(); }
+  });
+  document.getElementById("whoCard").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.id === "nameInput") addPerson();
+  });
+  document.getElementById("results").addEventListener("click", (e) => {
+    const lock = e.target.closest("[data-lock]");
+    const unlock = e.target.closest("[data-unlock]");
+    if (lock) { const [f, t] = lock.dataset.lock.split("|"); return lockTrip(f, t); }
+    if (unlock) return unlockTrip();
   });
   // pointerdown drives both a plain tap (cycle) and a drag (fill a range)
   document.getElementById("calGrid").addEventListener("pointerdown", onCalPointerDown);
 
   updateAll();
 }
+async function lockTrip(from, to) {
+  state.lockFrom = from; state.lockTo = to;
+  const t = state.groupTrips.find((x) => x.room === state.room);
+  if (t) { t.lock_from = from; t.lock_to = to; }
+  updateResults();
+  await tripSetLock(state.room, from, to);
+}
+async function unlockTrip() {
+  state.lockFrom = null; state.lockTo = null;
+  const t = state.groupTrips.find((x) => x.room === state.room);
+  if (t) { t.lock_from = null; t.lock_to = null; }
+  updateResults();
+  await tripSetLock(state.room, null, null);
+}
 
-function copyInvite() {
-  const link = location.origin + location.pathname + "?room=" + state.room;
+function copyLink(kind, code, btnId) {
+  const link = location.origin + location.pathname + "?" + kind + "=" + code;
   navigator.clipboard.writeText(link).then(() => {
-    const b = document.getElementById("copyBtn");
+    const b = document.getElementById(btnId);
+    if (!b) return;
     const t = b.textContent; b.textContent = "Copied!";
     setTimeout(() => (b.textContent = t), 1500);
   }).catch(() => prompt("Copy this invite link:", link));
 }
+function copyInvite() { copyLink("room", state.room, "copyBtn"); }
+function copyGroupInvite() { copyLink("group", state.group, "gCopyBtn"); }
 
 /* ---- shared header + tabs ---- */
 function headerHtml(active) {
   const code = (state.room || "").toUpperCase().split("")
     .map((ch) => `<span class="flap-tile">${escapeHtml(ch)}</span>`).join("");
+  const name = state.tripName ? escapeHtml(state.tripName) : "Name this trip";
   return `
     <header class="board">
       <div class="board-id">
         <span class="plane">&#9992;</span>
         <div>
-          <span class="eyebrow">Trip Planner &middot; Departures</span>
+          <span class="eyebrow">Trip Planner</span>
+          <div class="tripname-row">
+            <span class="tripname ${state.tripName ? "" : "placeholder"}" id="tripName">${name}</span>
+            <button class="editname" id="editName" title="Rename trip">&#9998;</button>
+          </div>
           <div class="flap" title="Trip code">${code}</div>
         </div>
       </div>
       <div class="board-actions">
+        ${state.group ? `<button class="btn ghost" id="groupBtn" title="Back to your group">&#8592; Group</button>` : ""}
         <div class="tabs">
           <button class="tab ${active === "schedule" ? "on" : ""}" data-tab="schedule">Schedule</button>
           <button class="tab ${active === "booking" ? "on" : ""}" data-tab="booking">Booking</button>
@@ -832,10 +1111,27 @@ function headerHtml(active) {
       </div>
     </header>`;
 }
+function updateBoardName() {
+  const el = document.getElementById("tripName");
+  if (!el) return;
+  el.textContent = state.tripName ? state.tripName : "Name this trip";
+  el.classList.toggle("placeholder", !state.tripName);
+}
+async function renameTrip() {
+  const next = window.prompt("Name this trip", state.tripName || "");
+  if (next === null) return;
+  state.tripName = next.trim().slice(0, 60);
+  updateBoardName();
+  await tripSetName(state.tripName);
+}
 function wireHeader() {
   document.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
   const c = document.getElementById("copyBtn");
   if (c) c.onclick = copyInvite;
+  const e = document.getElementById("editName");
+  if (e) e.onclick = renameTrip;
+  const g = document.getElementById("groupBtn");
+  if (g) g.onclick = () => { location.search = "?group=" + encodeURIComponent(state.group); };
 }
 function switchTab(t) {
   if (state.tab === t) return;
@@ -991,16 +1287,158 @@ async function bkUnlock() {
 /* ---- polling (keeps everyone in sync, no extra setup) ---- */
 async function poll() {
   if (!sb || document.visibilityState !== "visible") return;
+
+  if (state.mode === "group") {                 // hub: refresh roster + trip list
+    state.members = await membersFetch(state.group);
+    state.groupTrips = await tripsByGroup(state.group);
+    updateMembers(); updateTripsList();
+    return;
+  }
+
   if (state.tab !== "schedule" || state.drag) return;   // not while booking or mid-drag
   if (Date.now() - state.lastEditAt < 2500) return;      // don't stomp a fresh local edit
+  const meta = await tripMetaFetch(state.room);
+  if (meta.name !== state.tripName) { state.tripName = meta.name; updateBoardName(); }
+  state.lockFrom = meta.lock_from; state.lockTo = meta.lock_to;
   const rows = await dbFetch();
   if (!rows) return;
   state.people = rows;
+  if (state.group) {
+    state.groupTrips = await tripsByGroup(state.group);   // other trips' locks may have changed
+    applyOverlay(await overlayFetch());
+  }
   if (!state.people.find((p) => p.id === state.selectedId)) state.selectedId = state.people[0]?.id ?? null;
   updateAll();
 }
 
-/* ---- landing (create or join a room) ---- */
+/* ---- group hub (shared roster + the group's trips) ---- */
+function renderGroup() {
+  const code = (state.group || "").toUpperCase().split("")
+    .map((ch) => `<span class="flap-tile">${escapeHtml(ch)}</span>`).join("");
+  const name = state.groupName ? escapeHtml(state.groupName) : "Name this group";
+  document.getElementById("app").innerHTML = `
+    <div class="wrap">
+      <header class="board">
+        <div class="board-id">
+          <span class="plane">&#128101;</span>
+          <div>
+            <span class="eyebrow">Your group</span>
+            <div class="tripname-row">
+              <span class="tripname ${state.groupName ? "" : "placeholder"}" id="groupName">${name}</span>
+              <button class="editname" id="editGroupName" title="Rename group">&#9998;</button>
+            </div>
+            <div class="flap" title="Group code">${code}</div>
+          </div>
+        </div>
+        <div class="board-actions">
+          <button class="btn ghost" id="gCopyBtn">Invite link</button>
+        </div>
+      </header>
+
+      <div class="grid">
+        <div>
+          <div class="card" id="memberCard">
+            <h2>Members <span class="count" id="memberCount">0</span></h2>
+            <p class="hint" style="margin-top:0;margin-bottom:12px;">Everyone here can be added to any trip. Add a date to one trip and it blocks those days for the same people in your other trips.</p>
+            <div class="row">
+              <input class="inp" id="memberInput" placeholder="Add a friend's name" />
+              <button class="btn primary" id="memberAddBtn">Add</button>
+            </div>
+            <ul id="memberList"></ul>
+          </div>
+        </div>
+        <div>
+          <div class="card" id="tripsCard">
+            <h2>Trips <span class="count" id="tripCount">0</span></h2>
+            <button class="btn primary" id="newTripBtn" style="width:100%;justify-content:center;">New trip</button>
+            <ul class="triplist" id="tripList"></ul>
+          </div>
+          <p class="footnote">Send the <b>Invite link</b> so friends join the group once. Each trip still has its own link and its own booking details.</p>
+        </div>
+      </div>
+    </div>`;
+
+  document.getElementById("gCopyBtn").onclick = copyGroupInvite;
+  document.getElementById("editGroupName").onclick = renameGroup;
+  document.getElementById("memberAddBtn").onclick = addGroupMember;
+  document.getElementById("memberInput").addEventListener("keydown", (e) => { if (e.key === "Enter") addGroupMember(); });
+  document.getElementById("newTripBtn").onclick = newGroupTrip;
+  document.getElementById("memberList").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-delmember]");
+    if (del) removeGroupMember(del.dataset.delmember);
+  });
+  document.getElementById("tripList").addEventListener("click", (e) => {
+    const open = e.target.closest("[data-open]");
+    if (open) location.search = "?room=" + encodeURIComponent(open.dataset.open);
+  });
+  updateMembers();
+  updateTripsList();
+}
+function updateGroupName() {
+  const el = document.getElementById("groupName");
+  if (!el) return;
+  el.textContent = state.groupName ? state.groupName : "Name this group";
+  el.classList.toggle("placeholder", !state.groupName);
+}
+async function renameGroup() {
+  const next = window.prompt("Name this group", state.groupName || "");
+  if (next === null) return;
+  state.groupName = next.trim().slice(0, 60);
+  updateGroupName();
+  await groupSetName(state.groupName);
+}
+function updateMembers() {
+  const el = document.getElementById("memberList");
+  if (!el) return;
+  document.getElementById("memberCount").textContent = state.members.length;
+  el.innerHTML = state.members.length
+    ? state.members.map((m) => `
+        <li class="person">
+          <span class="name" style="flex:1;">${escapeHtml(m.name)}</span>
+          <button class="del" data-delmember="${m.id}" title="Remove from group">&times;</button>
+        </li>`).join("")
+    : `<li class="empty">No members yet. Add your friends above.</li>`;
+}
+function updateTripsList() {
+  const el = document.getElementById("tripList");
+  if (!el) return;
+  document.getElementById("tripCount").textContent = state.groupTrips.length;
+  el.innerHTML = state.groupTrips.length
+    ? state.groupTrips.map((t) => `
+        <li class="triprow">
+          <button class="pick" data-open="${t.room}" style="flex:1;background:none;border:0;padding:0;cursor:pointer;text-align:left;">
+            <span class="tname">${t.name ? escapeHtml(t.name) : "Untitled trip"}</span>
+            <span class="tcode"> &middot; ${escapeHtml(t.room.toUpperCase())}</span>
+          </button>
+          ${t.lock_from ? `<span class="tlock">&#128274; ${prettyRange(t.lock_from, t.lock_to)}</span>` : ""}
+        </li>`).join("")
+    : `<li class="empty">No trips yet. Start one with New trip.</li>`;
+}
+async function addGroupMember() {
+  const input = document.getElementById("memberInput");
+  const nm = input.value.trim();
+  if (!nm) return;
+  input.value = "";
+  const m = await memberAdd(state.group, nm);
+  if (!m) return;
+  state.members = [...state.members, m].sort((a, b) => a.name.localeCompare(b.name));
+  updateMembers();
+}
+async function removeGroupMember(id) {
+  state.members = state.members.filter((m) => m.id !== id);
+  updateMembers();
+  await memberDelete(id);
+}
+async function newGroupTrip() {
+  const nm = (window.prompt("Name this trip (optional)", "") || "").trim().slice(0, 60);
+  const room = Math.random().toString(36).slice(2, 9);
+  await tripCreateInGroup(room, state.group, nm);
+  // put the whole roster on the new trip by default
+  for (const m of state.members) {
+    await sb.from("people").insert({ room, member_id: m.id, name: m.name, days: [], prefers: [], busy: [], busy_reasons: {} });
+  }
+  location.search = "?room=" + room;
+}
 function renderLanding() {
   document.getElementById("app").innerHTML = `
     <div class="landing">
@@ -1014,11 +1452,13 @@ function renderLanding() {
           <p>Everyone marks when they can travel. You see the stretches that fit — then one person books.</p>
           ${configured ? `
             <button class="btn primary" id="createBtn" style="width:100%;justify-content:center;">Start a new trip</button>
+            <button class="btn" id="createGroupBtn" style="width:100%;justify-content:center;margin-top:8px;">Start a group of trips</button>
             <p class="or">or join one</p>
             <div class="row">
-              <input class="inp" id="joinCode" placeholder="Enter a trip code" />
+              <input class="inp" id="joinCode" placeholder="Enter a trip or group code" />
               <button class="btn" id="joinBtn">Join</button>
             </div>
+            <p class="hint" style="margin-top:10px;">A <b>group</b> keeps one list of friends across many trips, and blocks dates you've locked in one trip from clashing with the others.</p>
           ` : `
             <div class="setup">
               Almost there — open <code>index.html</code> and paste your Supabase
@@ -1034,22 +1474,60 @@ function renderLanding() {
     const code = Math.random().toString(36).slice(2, 9);
     location.search = "?room=" + code;
   };
+  document.getElementById("createGroupBtn").onclick = async () => {
+    const code = Math.random().toString(36).slice(2, 9);
+    await groupCreate(code, "");
+    location.search = "?group=" + code;
+  };
   document.getElementById("joinBtn").onclick = joinFromInput;
   document.getElementById("joinCode").addEventListener("keydown", (e) => { if (e.key === "Enter") joinFromInput(); });
 }
-function joinFromInput() {
+async function joinFromInput() {
   const code = document.getElementById("joinCode").value.trim();
-  if (code) location.search = "?room=" + encodeURIComponent(code);
+  if (!code) return;
+  const g = await groupFetch(code);            // a group code takes you to the hub
+  location.search = (g ? "?group=" : "?room=") + encodeURIComponent(code);
 }
 
 /* ---- boot ---- */
 async function boot() {
-  const room = new URLSearchParams(location.search).get("room");
-  if (!configured || !room) { renderLanding(); return; }
-  state.room = room;
-  render();
-  const rows = await dbFetch();
-  if (rows) { state.people = rows; state.selectedId = state.people[0]?.id ?? null; if (state.tab === "schedule") updateAll(); }
+  const params = new URLSearchParams(location.search);
+  const room = params.get("room"), group = params.get("group");
+  if (!configured) { renderLanding(); return; }
+
+  if (room) {
+    state.mode = "trip";
+    state.room = room;
+    const meta = await tripMetaFetch(room);
+    state.tripName = meta.name;
+    state.group = meta.group_code;
+    state.lockFrom = meta.lock_from; state.lockTo = meta.lock_to;
+    if (state.group) {
+      const g = await groupFetch(state.group);
+      state.groupName = g ? g.name : "";
+      state.members = await membersFetch(state.group);
+      state.groupTrips = await tripsByGroup(state.group);
+    }
+    render();
+    const rows = await dbFetch();
+    if (rows) {
+      state.people = rows;
+      if (state.group) applyOverlay(await overlayFetch());
+      state.selectedId = state.people[0]?.id ?? null;
+      if (state.tab === "schedule") updateAll();
+    }
+  } else if (group) {
+    const g = await groupFetch(group);
+    if (!g) { renderLanding(); return; }
+    state.mode = "group";
+    state.group = group; state.groupName = g.name;
+    state.members = await membersFetch(group);
+    state.groupTrips = await tripsByGroup(group);
+    renderGroup();
+  } else {
+    renderLanding();
+    return;
+  }
   setInterval(poll, 5000);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") poll(); });
 }
